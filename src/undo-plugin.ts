@@ -28,6 +28,34 @@ type Cursors = { anchor: Cursor | null; focus: Cursor | null };
  */
 const BOUND_UNDO_MANAGERS = new WeakSet<LoroUndoManager>();
 
+/**
+ * Walk the EditorState's plugin list and return the key of the first
+ * plugin that looks like a `prosemirror-history`-style undo manager,
+ * or `null` if no such plugin is present.
+ *
+ * Detection is by plugin-key prefix: PM's `PluginKey("history")`
+ * produces keys of the form `history$`, `history$1`, etc. (see
+ * `prosemirror-state`'s `createKey`). This catches the canonical
+ * `prosemirror-history` plugin and Tiptap's `History` extension
+ * (which is a thin wrapper around prosemirror-history).
+ *
+ * False positives: any third-party plugin that happens to use the
+ * name "history" in its `PluginKey`. Acceptable trade-off — the
+ * warning is non-fatal, and naming conflicts with "history" are
+ * rare in practice.
+ */
+function detectCompetingHistoryPlugin(
+  state: import("prosemirror-state").EditorState,
+): string | null {
+  for (const plugin of state.plugins) {
+    const pluginKey = (plugin as unknown as { key?: string }).key;
+    if (typeof pluginKey === "string" && pluginKey.startsWith("history$")) {
+      return pluginKey;
+    }
+  }
+  return null;
+}
+
 export const LoroUndoPlugin = (props: LoroUndoPluginProps): Plugin => {
   const undoManager = props.undoManager || new UndoManager(props.doc, {});
   undoManager.addExcludeOriginPrefix("sys:init");
@@ -125,6 +153,34 @@ export const LoroUndoPlugin = (props: LoroUndoPluginProps): Plugin => {
         );
       }
       BOUND_UNDO_MANAGERS.add(undoManager);
+
+      // Warn loudly if a competing PM history plugin is also mounted.
+      // Tiptap's StarterKit and many other host editors include
+      // `prosemirror-history` by default. Both plugins intercept
+      // Mod-Z independently and produce desynchronized state:
+      //   - PM history reverses local steps; the resulting tx flows
+      //     through the loroSyncPlugin and is recorded as a NEW Loro
+      //     commit (not a Loro UndoManager pop).
+      //   - Loro UndoManager records all PM-history-driven txs as
+      //     separate commits. Calling our `undo` then pops the wrong
+      //     entry and PM's history is out of sync with the doc.
+      //
+      // The fix is host-side: either disable the PM history plugin
+      // (e.g. `StarterKit.configure({ history: false })`) OR avoid
+      // calling our `undo`/`redo` and rely on PM history alone.
+      const competingHistoryName = detectCompetingHistoryPlugin(view.state);
+      if (competingHistoryName != null) {
+        console.warn(
+          `[loro-prosemirror] LoroUndoPlugin: a competing PM history plugin ` +
+            `("${competingHistoryName}") is mounted in the same EditorState. ` +
+            `Both will intercept undo independently; calling LoroUndoPlugin's ` +
+            `\`undo\`/\`redo\` while the other plugin is also active causes ` +
+            `desynchronization between PM history and the Loro op log. ` +
+            `Either disable the competing history plugin (e.g. ` +
+            `StarterKit.configure({ history: false })) or do not call ` +
+            `LoroUndoPlugin's commands.`,
+        );
+      }
 
       undoManager.setOnPush((isUndo, _counterRange) => {
         const loroState = loroSyncPluginKey.getState(view.state);
