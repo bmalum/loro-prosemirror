@@ -25,7 +25,9 @@ import {
   ROOT_DOC_KEY,
   type LoroDocType,
   type LoroNode,
+  type LoroNodeContainerType,
   type LoroNodeMapping,
+  createNodeFromLoroObj,
   updateLoroToPmState,
   getLoroMapChildren,
 } from "../src/lib";
@@ -40,6 +42,25 @@ const helloWorld = {
     { type: "paragraph", content: [{ type: "text", text: "Hello world" }] },
   ],
 };
+
+// Helper used by undo-plugin tests: materialise a PM doc from a Loro
+// inner doc AND populate a mapping that binds the resulting Node refs
+// to their Loro container IDs. Tests need this so cursor encoding can
+// resolve through the mapping during apply().
+function createNodeFromLoroObjWithMapping(
+  pmSchema: Schema,
+  innerDoc: LoroNode,
+  mapping: LoroNodeMapping,
+): import("prosemirror-model").Node {
+  const node = createNodeFromLoroObj(
+    pmSchema,
+    innerDoc as unknown as LoroNode & {
+      _branded: LoroNodeContainerType;
+    },
+    mapping,
+  );
+  return node;
+}
 
 // ---------------------------------------------------------------------------
 // Sync plugin: state immutability
@@ -219,13 +240,28 @@ describe("LoroSyncPlugin (error surfacing)", () => {
 // ---------------------------------------------------------------------------
 
 describe("LoroUndoPlugin (state shape)", () => {
-  test("prevSelection is in the plugin state (not in factory closure)", () => {
+  test("prevSelection is captured into plugin state on a doc-changing user tx", () => {
+    // Build a fully-synced Loro+PM pair so cursor encoding can resolve.
     const doc: LoroDocType = new LoroDoc();
-    updateLoroToPmState(doc, new Map(), createEditorState(schema, helloWorld));
+    const seedMapping: LoroNodeMapping = new Map();
+    updateLoroToPmState(
+      doc,
+      seedMapping,
+      createEditorState(schema, helloWorld),
+    );
+    // Build a NEW PM doc from Loro that shares Node identity with seedMapping.
+    const innerDoc = doc.getMap(ROOT_DOC_KEY) as LoroNode;
+    const buildMapping: LoroNodeMapping = new Map();
+    const pmDocFromLoro = createNodeFromLoroObjWithMapping(
+      schema,
+      innerDoc,
+      buildMapping,
+    );
+
     const plugin = LoroUndoPlugin({ doc });
-    const sync = LoroSyncPlugin({ doc });
+    const sync = LoroSyncPlugin({ doc, mapping: buildMapping });
     const editorState = EditorState.create({
-      doc: schema.nodeFromJSON(helloWorld),
+      doc: pmDocFromLoro,
       schema,
       plugins: [sync, plugin],
     });
@@ -235,15 +271,55 @@ describe("LoroUndoPlugin (state shape)", () => {
     ) as LoroUndoPluginState;
     expect(before.prevSelection).toBeNull();
 
-    // A user tx (no plugin meta) should capture the pre-tx selection.
-    const tr = editorState.tr.setSelection(
+    // A pure SELECTION-change tx must NOT capture (per gate fix).
+    const selOnlyTr = editorState.tr.setSelection(
       TextSelection.create(editorState.doc, 1),
     );
+    const afterSelOnly = editorState.apply(selOnlyTr);
+    expect(
+      (loroUndoPluginKey.getState(afterSelOnly) as LoroUndoPluginState)
+        .prevSelection,
+    ).toBeNull();
+
+    // A doc-changing user tx SHOULD capture pre-tx selection.
+    const editTr = afterSelOnly.tr.insertText("X", 1);
+    const afterEdit = afterSelOnly.apply(editTr);
+    const captured = (
+      loroUndoPluginKey.getState(afterEdit) as LoroUndoPluginState
+    ).prevSelection;
+    expect(captured).not.toBeNull();
+    expect(captured?.anchor).not.toBeNull();
+  });
+
+  test("addToHistory:false transactions do NOT capture prevSelection", () => {
+    const doc: LoroDocType = new LoroDoc();
+    const seedMapping: LoroNodeMapping = new Map();
+    updateLoroToPmState(
+      doc,
+      seedMapping,
+      createEditorState(schema, helloWorld),
+    );
+    const innerDoc = doc.getMap(ROOT_DOC_KEY) as LoroNode;
+    const buildMapping: LoroNodeMapping = new Map();
+    const pmDocFromLoro = createNodeFromLoroObjWithMapping(
+      schema,
+      innerDoc,
+      buildMapping,
+    );
+    const plugin = LoroUndoPlugin({ doc });
+    const sync = LoroSyncPlugin({ doc, mapping: buildMapping });
+    const editorState = EditorState.create({
+      doc: pmDocFromLoro,
+      schema,
+      plugins: [sync, plugin],
+    });
+
+    const tr = editorState.tr.insertText("Y", 1);
+    tr.setMeta("addToHistory", false);
     const after = editorState.apply(tr);
-    const undoState = loroUndoPluginKey.getState(after) as LoroUndoPluginState;
-    // prevSelection captured against oldState — selection was at 0 (default).
-    // It should now be a non-null Cursors object.
-    expect(undoState.prevSelection).not.toBeNull();
+    expect(
+      (loroUndoPluginKey.getState(after) as LoroUndoPluginState).prevSelection,
+    ).toBeNull();
   });
 
   test("undo/redo set isUndoing.current synchronously and clear it via try/finally", () => {
