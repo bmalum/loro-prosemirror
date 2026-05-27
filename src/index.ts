@@ -21,6 +21,7 @@ export {
 } from "./lib";
 export {
   findContainerLocation,
+  findEmptyTextPosition,
   loroEventBatchToTransaction,
   type ContainerLocation,
 } from "./incremental-sync";

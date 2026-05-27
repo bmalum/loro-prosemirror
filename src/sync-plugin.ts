@@ -220,8 +220,15 @@ function tryIncrementalSync(
     );
   } catch (e) {
     console.error(
-      "[loro-prosemirror] incremental sync failed, falling back to full replace:",
-      e,
+      "[loro-prosemirror] incremental sync threw, falling back to full replace.",
+      {
+        error: e,
+        batchBy: event.by,
+        batchOrigin: event.origin,
+        eventCount: event.events.length,
+        firstTarget: event.events[0]?.target,
+        firstDiffType: event.events[0]?.diff.type,
+      },
     );
     return null;
   }

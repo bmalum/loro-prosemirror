@@ -779,17 +779,16 @@ describe("loroEventBatchToTransaction (edge cases)", () => {
     expect(newState.doc.child(2).textContent).toBe("Brand new");
   });
 
-  test("returns null when an event references a container with no mapping", async () => {
-    // Build a fixture, then deliberately corrupt the mapping by removing the
-    // first paragraph's binding. A subsequent text edit on that paragraph
-    // can't be located and the translator must bail (caller falls back).
+  test("recovers a LoroText position via parent walk when the text entry is missing", async () => {
+    // After `updateLoroToPmState` empties a paragraph's text it prunes
+    // the LoroText's mapping entry. A subsequent remote insert into that
+    // text container would previously fall back to a full rebuild;
+    // findEmptyTextPosition now walks to the parent block and recovers
+    // the insertion offset from the children list.
     const { loroDoc, editorState, mapping } = buildSyncedFixture(helloWorldDoc);
     const innerDoc = loroDoc.getMap(ROOT_DOC_KEY) as LoroNode;
     const firstPara = getLoroMapChildren(innerDoc).get(0) as LoroNode;
     const firstText = getLoroMapChildren(firstPara).get(0) as LoroText;
-
-    // Drop the text container's mapping entry — simulates a brand-new
-    // container that has not been materialised into PM yet.
     mapping.delete(firstText.id);
 
     const { batches, dispose } = captureEvents(loroDoc);
@@ -804,10 +803,34 @@ describe("loroEventBatchToTransaction (edge cases)", () => {
       mapping,
       loroDoc,
     );
+    expect(tr).not.toBeNull();
+    const newState = editorState.apply(tr!);
+    expect(newState.doc.child(0).textContent).toBe("XHello world");
+  });
+
+  test("falls back when even the parent block has no mapping entry", async () => {
+    // Drop both the text *and* its parent block. With no anchor at all
+    // the translator must bail and let the safety net handle it.
+    const { loroDoc, editorState, mapping } = buildSyncedFixture(helloWorldDoc);
+    const innerDoc = loroDoc.getMap(ROOT_DOC_KEY) as LoroNode;
+    const firstPara = getLoroMapChildren(innerDoc).get(0) as LoroNode;
+    const firstText = getLoroMapChildren(firstPara).get(0) as LoroText;
+    mapping.delete(firstText.id);
+    mapping.delete(firstPara.id);
+
+    const { batches, dispose } = captureEvents(loroDoc);
+    firstText.insert(0, "X");
+    loroDoc.commit();
+    await oneMs();
+    dispose();
+
+    const tr = loroEventBatchToTransaction(
+      editorState,
+      batches[0],
+      mapping,
+      loroDoc,
+    );
     expect(tr).toBeNull();
-    // The legacy full-replace path is what the plugin uses when this
-    // happens; we only assert here that the translator signals the bail
-    // correctly and never throws.
   });
 
   test("converges A and B under a randomized sequence of edits (fuzz roundtrip)", async () => {
@@ -967,5 +990,192 @@ describe("loroEventBatchToTransaction (edge cases)", () => {
       );
       expect(tr).not.toBeNull();
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Review fixes: mapping pruning + emptied-text re-insert + checkout policy
+// ---------------------------------------------------------------------------
+
+describe("loroEventBatchToTransaction (review fixes)", () => {
+  test("prunes the mapping when a paragraph is deleted incrementally", async () => {
+    const { loroDoc, editorState, mapping } = buildSyncedFixture(helloWorldDoc);
+    const innerDoc = loroDoc.getMap(ROOT_DOC_KEY) as LoroNode;
+    const dropPara = getLoroMapChildren(innerDoc).get(1) as LoroNode;
+    const dropParaId = dropPara.id;
+    const dropTextId = (getLoroMapChildren(dropPara).get(0) as LoroText).id;
+
+    expect(mapping.has(dropParaId)).toBe(true);
+    expect(mapping.has(dropTextId)).toBe(true);
+    const sizeBefore = mapping.size;
+
+    const { batches, dispose } = captureEvents(loroDoc);
+    getLoroMapChildren(innerDoc).delete(1, 1);
+    loroDoc.commit();
+    await oneMs();
+    dispose();
+
+    const tr = loroEventBatchToTransaction(
+      editorState,
+      batches[0],
+      mapping,
+      loroDoc,
+    );
+    expect(tr).not.toBeNull();
+
+    // The deleted block and its text run are no longer in the mapping.
+    expect(mapping.has(dropParaId)).toBe(false);
+    expect(mapping.has(dropTextId)).toBe(false);
+    expect(mapping.size).toBeLessThan(sizeBefore);
+  });
+
+  test("prunes nested mappings when a deeply-nested block is deleted", async () => {
+    const fixture = {
+      type: "doc",
+      content: [
+        {
+          type: "bulletList",
+          content: [
+            {
+              type: "listItem",
+              content: [
+                {
+                  type: "paragraph",
+                  content: [{ type: "text", text: "Inner" }],
+                },
+              ],
+            },
+            {
+              type: "listItem",
+              content: [
+                {
+                  type: "paragraph",
+                  content: [{ type: "text", text: "Survivor" }],
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    };
+    const { loroDoc, editorState, mapping } = buildSyncedFixture(fixture);
+    const innerDoc = loroDoc.getMap(ROOT_DOC_KEY) as LoroNode;
+    const list = getLoroMapChildren(innerDoc).get(0) as LoroNode;
+    const dropItem = getLoroMapChildren(list).get(0) as LoroNode;
+    const dropPara = getLoroMapChildren(dropItem).get(0) as LoroNode;
+    const dropText = getLoroMapChildren(dropPara).get(0) as LoroText;
+
+    const { batches, dispose } = captureEvents(loroDoc);
+    getLoroMapChildren(list).delete(0, 1);
+    loroDoc.commit();
+    await oneMs();
+    dispose();
+
+    const tr = loroEventBatchToTransaction(
+      editorState,
+      batches[0],
+      mapping,
+      loroDoc,
+    );
+    expect(tr).not.toBeNull();
+
+    // Every level of the deleted subtree should have been pruned.
+    expect(mapping.has(dropItem.id)).toBe(false);
+    expect(mapping.has(dropPara.id)).toBe(false);
+    expect(mapping.has(dropText.id)).toBe(false);
+  });
+
+  test("re-inserts into a fully-emptied LoroText incrementally", async () => {
+    // Reproduces bug 2 from the review. After all the text is deleted the
+    // LoroText still exists in Loro but a real plugin's
+    // updateLoroToPmState would prune the mapping entry for it. We
+    // simulate that pruning, then issue a remote insert into the empty
+    // text container — the translator must succeed via the parent-walk
+    // fallback rather than bailing to full rebuild.
+    const { loroDoc, editorState, mapping } = buildSyncedFixture({
+      type: "doc",
+      content: [
+        { type: "paragraph", content: [{ type: "text", text: "ABC" }] },
+      ],
+    });
+    const innerDoc = loroDoc.getMap(ROOT_DOC_KEY) as LoroNode;
+    const para = getLoroMapChildren(innerDoc).get(0) as LoroNode;
+    const text = getLoroMapChildren(para).get(0) as LoroText;
+
+    // Step 1: remote deletes all text → translator empties the run.
+    const { batches: del, dispose: disposeDel } = captureEvents(loroDoc);
+    text.delete(0, 3);
+    loroDoc.commit();
+    await oneMs();
+    disposeDel();
+    const trDel = loroEventBatchToTransaction(
+      editorState,
+      del[0],
+      mapping,
+      loroDoc,
+    );
+    expect(trDel).not.toBeNull();
+    const stateAfterDel = editorState.apply(trDel!);
+    // Real plugin: doc-changed appendTransaction triggers
+    // `updateLoroToPmState`, which (a) refreshes the mapping with the
+    // post-tr Node references and (b) prunes the empty LoroText entry.
+    // We mirror both effects here so the test reproduces the production
+    // mapping shape.
+    const refreshedMapping = rebindMapping(stateAfterDel.doc, innerDoc);
+    refreshedMapping.delete(text.id);
+
+    // Step 2: remote inserts into the now-empty paragraph.
+    const { batches: ins, dispose: disposeIns } = captureEvents(loroDoc);
+    text.insert(0, "Z");
+    loroDoc.commit();
+    await oneMs();
+    disposeIns();
+    const trIns = loroEventBatchToTransaction(
+      stateAfterDel,
+      ins[0],
+      refreshedMapping,
+      loroDoc,
+    );
+    expect(trIns).not.toBeNull();
+    const stateAfterIns = stateAfterDel.apply(trIns!);
+    expect(stateAfterIns.doc.child(0).textContent).toBe("Z");
+  });
+
+  test("routes checkout events to the fallback regardless of diff content", async () => {
+    // We don't validate the translator on checkout-shaped diffs — even a
+    // 'simple' checkout could in principle rewrite the whole document.
+    // Loro emits `event.by === "checkout"` for these; the translator
+    // must return null so the safety-net rebuild handles the batch.
+    const { loroDoc, editorState, mapping } = buildSyncedFixture(helloWorldDoc);
+
+    const fakeBatch: LoroEventBatch = {
+      by: "checkout",
+      events: [],
+      from: [],
+      to: [],
+    };
+    expect(
+      loroEventBatchToTransaction(editorState, fakeBatch, mapping, loroDoc),
+    ).toBeNull();
+
+    // Even a non-empty checkout batch should bail.
+    const innerDoc = loroDoc.getMap(ROOT_DOC_KEY) as LoroNode;
+    const text = getLoroMapChildren(
+      getLoroMapChildren(innerDoc).get(0) as LoroNode,
+    ).get(0) as LoroText;
+    const { batches, dispose } = captureEvents(loroDoc);
+    text.insert(0, "X");
+    loroDoc.commit();
+    await oneMs();
+    dispose();
+    const checkoutShaped: LoroEventBatch = { ...batches[0], by: "checkout" };
+    expect(
+      loroEventBatchToTransaction(
+        editorState,
+        checkoutShaped,
+        mapping,
+        loroDoc,
+      ),
+    ).toBeNull();
   });
 });

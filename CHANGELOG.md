@@ -15,9 +15,24 @@ All notable changes to this project will be documented in this file. See [standa
   document rebuild is retained as a safety net for diff kinds the
   translator doesn't yet handle (`tree`, `counter`, mark names absent
   from the schema), so the ProseMirror doc never diverges from Loro.
-- Export `loroEventBatchToTransaction` and `findContainerLocation` for
-  advanced consumers that want to compose the translator with their own
-  view layer.
+- Export `loroEventBatchToTransaction`, `findContainerLocation` and
+  `findEmptyTextPosition` for advanced consumers that want to compose
+  the translator with their own view layer.
+
+### Bug fixes / hardening
+
+- Prune the mapping when a list-delete is applied incrementally,
+  preventing a slow memory leak in long collab sessions.
+- Recover the PM position of a `LoroText` whose mapping entry has been
+  pruned (the typical "remote user emptied the paragraph then types
+  again" pattern). Previously this fell back to a full doc rebuild on
+  every keystroke; now it stays on the surgical path.
+- Route `event.by === "checkout"` batches to the safety-net rebuild
+  unconditionally; checkout shapes can rewrite the doc and have not
+  been benchmarked end-to-end on the incremental path.
+- Carry batch context (`by`, `origin`, event count, first target,
+  first diff type) in the error log emitted when the translator
+  throws — significantly easier to debug from production traces.
 
 ## [0.4.3](https://github.com/loro-dev/loro-prosemirror/compare/v0.4.2...v0.4.3) (2026-02-19)
 
