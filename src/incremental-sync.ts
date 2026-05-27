@@ -277,6 +277,19 @@ export function loroEventBatchToTransaction(
   // in this batch (a sibling/ancestor mutation shifts pre-batch PM
   // coordinates that the parent-walk relies on).
   const parentTouchedInBatch = new Set<ContainerID>();
+  // Block IDs whose subtree contains a dirty container — i.e. an
+  // earlier event in this batch mutated some container within their
+  // subtree (text-diff, list-diff, or map-diff). For these blocks,
+  // pre-state child widths from `snapshotChildren` may differ from
+  // their tr.doc widths (because a descendant text/list grew or
+  // shrunk). When `applyListDiff` runs against such a block, the
+  // `pmCursor` arithmetic against pre-state widths produces invalid
+  // tr.doc positions — bail to fallback instead.
+  //
+  // Populated via `markContainerDirty` whenever an event mutates a
+  // container; the helper walks UP and adds every ancestor block to
+  // this set.
+  const dirtyAncestorBlocks = new Set<ContainerID>();
   // Memoise findContainerLocation across the batch — without this it is
   // O(doc_size) per event and a 50-event batch on a 5KB doc is 250K
   // descendant visits.
@@ -294,6 +307,7 @@ export function loroEventBatchToTransaction(
       doc,
       materialisedInBatch,
       parentTouchedInBatch,
+      dirtyAncestorBlocks,
       locationCache,
     );
     if (!ok) {
@@ -301,6 +315,36 @@ export function loroEventBatchToTransaction(
     }
   }
   return tr;
+}
+
+/**
+ * Walk up from `target` and add every ancestor block (LoroMap with a
+ * `nodeName`) ID to `set`. Used to mark "this block's subtree has had
+ * a mutation" so subsequent list events on the block bail to fallback
+ * (their pre-state child widths would be stale).
+ */
+function markAncestorsDirty(
+  doc: LoroDocType,
+  target: ContainerID,
+  set: Set<ContainerID>,
+): void {
+  const c = doc.getContainerById(target);
+  if (c == null) return;
+  let p: unknown = c.parent();
+  while (p != null) {
+    if (p instanceof LoroMap && (p as LoroMap).get(NODE_NAME_KEY) != null) {
+      set.add((p as LoroMap).id);
+    }
+    if (
+      p instanceof LoroMap ||
+      p instanceof LoroList ||
+      p instanceof LoroText
+    ) {
+      p = (p as { parent: () => unknown }).parent();
+    } else {
+      break;
+    }
+  }
 }
 
 function applyEvent(
@@ -311,6 +355,7 @@ function applyEvent(
   doc: LoroDocType,
   materialisedInBatch: Set<ContainerID>,
   parentTouchedInBatch: Set<ContainerID>,
+  dirtyAncestorBlocks: Set<ContainerID>,
   locationCache: Map<ContainerID, ContainerLocation | null>,
 ): boolean {
   switch (event.diff.type) {
@@ -323,6 +368,7 @@ function applyEvent(
         mapping,
         doc,
         parentTouchedInBatch,
+        dirtyAncestorBlocks,
         locationCache,
       );
     case "list":
@@ -335,6 +381,7 @@ function applyEvent(
         doc,
         materialisedInBatch,
         parentTouchedInBatch,
+        dirtyAncestorBlocks,
         locationCache,
       );
     case "map":
@@ -345,6 +392,7 @@ function applyEvent(
         event.diff,
         mapping,
         doc,
+        dirtyAncestorBlocks,
         locationCache,
       );
     default:
@@ -365,6 +413,7 @@ function applyTextDiff(
   mapping: LoroNodeMapping,
   doc: LoroDocType,
   parentTouchedInBatch: Set<ContainerID>,
+  dirtyAncestorBlocks: Set<ContainerID>,
   locationCache: Map<ContainerID, ContainerLocation | null>,
 ): boolean {
   const loc = findContainerLocation(state.doc, target, mapping, locationCache);
@@ -438,6 +487,10 @@ function applyTextDiff(
       return false;
     }
   }
+  // Text mutation succeeded — mark the text container's ancestors
+  // dirty so that a later list-event on any of them bails to
+  // fallback (their pre-state child widths are now stale).
+  markAncestorsDirty(doc, target, dirtyAncestorBlocks);
   return true;
 }
 
@@ -549,6 +602,7 @@ function applyListDiff(
   doc: LoroDocType,
   materialisedInBatch: Set<ContainerID>,
   parentTouchedInBatch: Set<ContainerID>,
+  dirtyAncestorBlocks: Set<ContainerID>,
   locationCache: Map<ContainerID, ContainerLocation | null>,
 ): boolean {
   const loroList = doc.getContainerById(target);
@@ -569,6 +623,18 @@ function applyListDiff(
   // even though tr already contains the first event's inserts/deletes
   // — producing inconsistent absolute positions.
   if (parentTouchedInBatch.has(parentMap.id)) {
+    return false;
+  }
+  // Also bail when ANY descendant of this block has been mutated by a
+  // previous event in this batch. snapshotChildren reads pre-state PM
+  // child widths, but any descendant mutation (text/list/map) changes
+  // the descendant's tr.doc width — making `contentStart + pmCursor`
+  // arithmetic land on the wrong tr.doc position. Concrete failure:
+  // event 1 inserts a list-item into ul (size +6), event 5 deletes a
+  // sibling paragraph from doc.children — without this guard, event 5's
+  // tr.delete walks past ul's pre-state size and lands inside the
+  // newly-inserted list-item, corrupting the doc.
+  if (dirtyAncestorBlocks.has(parentMap.id)) {
     return false;
   }
 
@@ -686,6 +752,12 @@ function applyListDiff(
 
   if (listChanged) {
     parentTouchedInBatch.add(parentMap.id);
+    // The list mutation may have changed the parent block's overall
+    // width in tr.doc (children added/removed). Mark every ancestor
+    // block dirty so a later applyListDiff on any of them bails to
+    // fallback rather than computing positions from stale pre-state
+    // child widths.
+    markAncestorsDirty(doc, target, dirtyAncestorBlocks);
   }
   return true;
 }
@@ -870,6 +942,7 @@ function applyMapDiff(
   diff: MapDiff,
   mapping: LoroNodeMapping,
   doc: LoroDocType,
+  dirtyAncestorBlocks: Set<ContainerID>,
   locationCache: Map<ContainerID, ContainerLocation | null>,
 ): boolean {
   const container = doc.getContainerById(target);
@@ -888,6 +961,20 @@ function applyMapDiff(
   }
   const attrsContainer = parent.get(ATTRIBUTES_KEY);
   if (!(attrsContainer instanceof LoroMap) || attrsContainer.id !== target) {
+    return false;
+  }
+
+  // If a prior event already mutated this block's attributes, bail.
+  // Our `newAttrs = { ...blockNode.attrs, ...diff.updated }` reads
+  // pre-state attrs from the cached PM node, so a second diff would
+  // miss the first diff's changes. Loro typically coalesces multiple
+  // attr changes per container into one MapDiff, so this case is
+  // rare — but it CAN occur in checkout/replay scenarios.
+  //
+  // Track via dirtyAncestorBlocks: when a previous applyMapDiff ran
+  // on this block, it added the block's id. Re-targeting the same
+  // block is detected here.
+  if (dirtyAncestorBlocks.has(parent.id)) {
     return false;
   }
 
@@ -919,6 +1006,11 @@ function applyMapDiff(
   } catch {
     return false;
   }
+  // Mark this block (and ancestors) as dirty so a later list event
+  // on an ancestor bails — attribute changes can affect a node's
+  // PM nodeSize for nodes whose toDOM depends on attrs (rare but
+  // possible). Conservative.
+  markAncestorsDirty(doc, target, dirtyAncestorBlocks);
   return true;
 }
 
