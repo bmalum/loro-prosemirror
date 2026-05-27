@@ -1,6 +1,7 @@
 import {
   type ContainerID,
   Cursor,
+  isContainerId,
   LoroList,
   LoroText,
   type PeerID,
@@ -98,7 +99,14 @@ export const createCursorPlugin = (
         );
       },
       apply(tr, prevState, _oldState, newState) {
-        const loroState = loroSyncPluginKey.getState(newState);
+        // Read the sync state from oldState as a fallback in case PM has
+        // not yet populated newState's plugin field for the sync plugin
+        // (this can happen if a host orders plugins by name/priority such
+        // that the sync plugin runs *after* the cursor plugin during apply
+        // — a real concern for Tiptap/BlockNote consumers).
+        const loroState =
+          loroSyncPluginKey.getState(newState) ??
+          loroSyncPluginKey.getState(_oldState);
         const loroCursorState: { presenceUpdated: boolean } =
           tr.getMeta(pluginKey);
         if (
@@ -125,22 +133,24 @@ export const createCursorPlugin = (
     view: (view) => {
       const storeListener = (origin: "local" | "import" | "timeout") => {
         if (origin !== "local") {
-          setTimeout(() => {
+          queueMicrotask(() => {
             if (view.isDestroyed) {
               return;
             }
-            let tr = view.state.tr;
+            const tr = view.state.tr;
             tr.setMeta(pluginKey, {
               presenceUpdated: true,
             });
+            tr.setMeta("addToHistory", false);
             view.dispatch(tr);
-          }, 0);
+          });
         }
       };
 
       const updateCursorInfo = () => {
-        // This will be called whenever the view is updated
-        // We may need to optimize it
+        if (view.isDestroyed) {
+          return;
+        }
         const loroState = loroSyncPluginKey.getState(view.state);
         const current = store.getLocal();
         if (loroState?.doc == null) {
@@ -150,11 +160,27 @@ export const createCursorPlugin = (
         const pmRootNode = view.state.doc;
         if (view.hasFocus()) {
           const selection = getSelection(view.state);
-          const { anchor, focus } = convertPmSelectionToCursors(
-            pmRootNode,
-            selection,
-            loroState,
-          );
+          let anchor: Cursor | undefined;
+          let focus: Cursor | undefined;
+          try {
+            const encoded = convertPmSelectionToCursors(
+              pmRootNode,
+              selection,
+              loroState,
+            );
+            anchor = encoded.anchor;
+            focus = encoded.focus;
+          } catch (e) {
+            // Encoding failures (mapping miss, container races, etc.) must
+            // not bubble up: if they reach view.dispatch they'd tear the
+            // editor down on every keystroke. Skip this awareness update;
+            // the next selection change will retry.
+            console.warn(
+              "[loro-prosemirror] cursor encode failed, skipping awareness update",
+              e,
+            );
+            return;
+          }
           if (
             current == null ||
             !cursorEq(current.anchor, anchor) ||
@@ -165,7 +191,6 @@ export const createCursorPlugin = (
               anchor,
               focus,
             });
-          } else {
           }
         } else if (current?.focus != null) {
           store.setLocal({});
@@ -218,18 +243,24 @@ function createDecorations(
       continue;
     }
 
-    const [focus, focusCursorUpdate] = cursorToAbsolutePosition(
+    const [focus] = cursorToAbsolutePosition(
       cursor.focus,
       doc as LoroDocType,
       loroState.mapping,
     );
+    if (focus == null) {
+      continue;
+    }
     d.push(Decoration.widget(focus, createCursor(peer as PeerID)));
     if (!cursorEq(cursor.anchor, cursor.focus)) {
-      const [anchor, anchorCursorUpdate] = cursorToAbsolutePosition(
+      const [anchor] = cursorToAbsolutePosition(
         cursor.anchor,
         doc as LoroDocType,
         loroState.mapping,
       );
+      if (anchor == null) {
+        continue;
+      }
       d.push(
         Decoration.inline(
           Math.min(anchor, focus),
@@ -237,32 +268,10 @@ function createDecorations(
           createSelection(peer as PeerID),
         ),
       );
-      if (focusCursorUpdate || anchorCursorUpdate) {
-        const existingLocalState = store.getLocal();
-        store.setLocal({
-          ...(existingLocalState?.user && {
-            user: existingLocalState.user,
-          }),
-          anchor: anchorCursorUpdate || cursor.anchor,
-          focus: focusCursorUpdate || cursor.focus,
-        });
-      }
-    } else {
-      if (focusCursorUpdate) {
-        const existingLocalState = store.getLocal();
-        store.setLocal({
-          ...(existingLocalState?.user && {
-            user: existingLocalState.user,
-          }),
-          focus: focusCursorUpdate,
-          anchor: focusCursorUpdate,
-        });
-      }
     }
   }
 
-  const decorations = DecorationSet.create(state.doc, d);
-  return decorations;
+  return DecorationSet.create(state.doc, d);
 }
 
 export function convertPmSelectionToCursors(
@@ -289,9 +298,10 @@ export function convertPmSelectionToCursors(
 }
 
 function getByValue(map: Map<ContainerID, Node | Node[]>, searchValue: Node) {
-  for (let [key, value] of map.entries()) {
+  for (const [key, value] of map.entries()) {
     if (value === searchValue) return key;
   }
+  return undefined;
 }
 
 function absolutePositionToCursor(
@@ -308,13 +318,15 @@ function absolutePositionToCursor(
     WEAK_NODE_TO_LORO_CONTAINER_MAPPING.get(nodeParent) ??
     getByValue(mapping, nodeParent);
   if (!loroId) {
-    if (anchor > 1) {
-      console.error("Cannot find the loroNode");
-    }
-    return;
+    // Selection sits on an unmapped node — most often a transient race
+    // during init or right after a remote insert that hasn't been bound
+    // yet. Returning undefined silently lets the next update retry; do
+    // not log a console.error here (it would fire on every selection
+    // change in those windows and pollute consumer logs).
+    return undefined;
   }
 
-  const loroMap: LoroNode = doc.getMap(loroId as any);
+  const loroMap: LoroNode = doc.getMap(loroId as never);
   const children = loroMap.get(CHILDREN_KEY);
   if (children.length == 0) {
     // This is a new line, so we can use the list cursor instead
@@ -349,37 +361,45 @@ export function cursorToAbsolutePosition(
   cursor: Cursor,
   doc: LoroDocType,
   mapping: LoroNodeMapping,
-): [number, Cursor | undefined] {
+): [number | null, Cursor | undefined] {
   const containerId = cursor.containerId();
+  // Discriminate by the actual container type rather than by string-
+  // sniffing the container ID — Loro's ID format is a stable but
+  // implementation detail and `endsWith("List")` would silently
+  // misroute if it ever changed.
+  if (!isContainerId(containerId)) {
+    return [null, undefined];
+  }
+  const container = doc.getContainerById(containerId);
+  if (container == null) {
+    return [null, undefined];
+  }
+
   let index = -1;
   let targetChildId: ContainerID;
   let loroNode: LoroNode | undefined;
   let update: Cursor | undefined;
-  if (containerId.endsWith("List")) {
-    const loroList = doc.getContainerById(containerId) as LoroList | undefined;
-    if (!loroList) {
-      return [1, undefined];
-    }
-
-    const parentNode = loroList.parent();
+  if (container instanceof LoroList) {
+    const parentNode = container.parent();
     if (!parentNode) {
-      return [1, undefined];
+      return [null, undefined];
     }
-
     targetChildId = parentNode.id;
     loroNode = parentNode.parent()?.parent() as LoroNode | undefined;
     index = 0;
-  } else {
-    const loroText = doc.getText(containerId);
+  } else if (container instanceof LoroText) {
     const pos = doc.getCursorPos(cursor);
     if (!pos) {
-      return [1, undefined];
+      return [null, undefined];
     }
     update = pos.update;
     index += pos.offset;
-    targetChildId = loroText.id;
-    loroNode = loroText.parent()?.parent() as LoroNode | undefined;
+    targetChildId = container.id;
+    loroNode = container.parent()?.parent() as LoroNode | undefined;
+  } else {
+    return [null, undefined];
   }
+
   while (loroNode != null) {
     const children = loroNode.get(CHILDREN_KEY);
     if (children instanceof LoroList) {
@@ -394,20 +414,24 @@ export function cursorToAbsolutePosition(
           mapped.forEach((child) => {
             index += child.nodeSize;
           });
-        } else {
-          if (mapped != null) {
-            index += mapped.nodeSize;
-          } else {
-            console.error(childIds, children.toJSON());
-          }
+        } else if (mapped != null) {
+          index += mapped.nodeSize;
         }
+        // If a sibling has no mapping entry we silently treat it as
+        // size 0. This matches the behaviour for a freshly-emptied
+        // LoroText whose mapping entry was pruned. The previous
+        // implementation logged a console.error here on every cursor
+        // movement that touched an unmapped sibling — extremely noisy
+        // and not actionable.
       }
 
       targetChildId = loroNode.id;
       loroNode = loroNode.parent()?.parent() as LoroNode | undefined;
       index += 1;
     } else {
-      throw new Error("Unreachable code");
+      // Unreachable in a well-formed Loro tree; bail rather than throw
+      // so an unexpected shape does not propagate as a crash.
+      return [null, update];
     }
   }
 

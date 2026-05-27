@@ -1,7 +1,14 @@
 import type { Loro } from "loro-crdt";
 import type { Schema } from "prosemirror-model";
 
-const LORO_TEXT_STYLE_CACHE = new WeakSet<Loro>();
+// Cache the configured (doc, schema) pairs. We need both axes:
+//   - Per-doc: don't reconfigure the same doc more than once.
+//   - Per-schema: if a host application creates a second editor on the
+//     same Loro doc with a different schema (different mark set), the
+//     second editor MUST be allowed to register its own mark expand
+//     rules — otherwise the second editor's marks would silently lose
+//     their inclusive/exclusive behaviour.
+const LORO_TEXT_STYLE_CACHE = new WeakMap<Loro, WeakSet<Schema>>();
 
 function getLoroTextStyle(schema: Schema): {
   [mark: string]: { expand: "before" | "after" | "none" | "both" };
@@ -15,11 +22,14 @@ function getLoroTextStyle(schema: Schema): {
 }
 
 export function configLoroTextStyle(doc: Loro, schema: Schema) {
-  // Avoid reconfiguring the text style for the same Loro document.
-  if (LORO_TEXT_STYLE_CACHE.has(doc)) {
+  let schemaSet = LORO_TEXT_STYLE_CACHE.get(doc);
+  if (schemaSet == null) {
+    schemaSet = new WeakSet<Schema>();
+    LORO_TEXT_STYLE_CACHE.set(doc, schemaSet);
+  }
+  if (schemaSet.has(schema)) {
     return;
   }
-  LORO_TEXT_STYLE_CACHE.add(doc);
-
+  schemaSet.add(schema);
   doc.configTextStyle(getLoroTextStyle(schema));
 }
