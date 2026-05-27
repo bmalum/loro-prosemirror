@@ -27,6 +27,14 @@ const nodes: { [key: string]: NodeSpec } = {
   text: {
     group: "inline",
   },
+  image: {
+    inline: true,
+    group: "inline",
+    attrs: { src: { default: "" } },
+    selectable: true,
+    atom: true,
+    toDOM: (node) => ["img", { src: String(node.attrs.src) }],
+  },
 };
 
 const marks: { [key: string]: MarkSpec } = {
