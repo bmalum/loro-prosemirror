@@ -364,7 +364,18 @@ function absolutePositionToCursor(
     const child = children.get(childIndex);
     childIndex += 1;
     if (child instanceof LoroText) {
-      return child.getCursor(index);
+      // Walk past text runs that don't cover this offset. PM stores
+      // a paragraph with mixed inline content (text + image + text)
+      // as multiple Loro children, where each LoroText covers a
+      // contiguous run between non-text inline nodes. The cursor's
+      // PM offset must be matched to the run that actually contains
+      // it — returning the FIRST text run unconditionally would
+      // misroute the cursor to the wrong container.
+      const textLen = child.length;
+      if (index < textLen) {
+        return child.getCursor(index);
+      }
+      index -= textLen;
     } else {
       if (index == 0) {
         // This happens when user selects an image or a horizontal rule
