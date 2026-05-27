@@ -141,6 +141,43 @@ Hosts that maintain a wire-push layer (e.g. a `subscribeLocalUpdates`
 listener that pushes ops to a server) can use the `init` event to
 distinguish expected init seeding from runtime regressions.
 
+### Logging
+
+By default the plugin only emits `error` and `warn` messages via
+`console.*`. Pass a `logger` prop to opt into structured logging or
+verbose tracing:
+
+```ts
+import {
+  LoroSyncPlugin,
+  createConsoleLogger,
+  silentLogger,
+} from "loro-prosemirror";
+
+// Verbose: print every event-batch entry, skip filter, and PM->Loro
+// write trace.
+LoroSyncPlugin({ doc, logger: createConsoleLogger("debug") });
+
+// Production-quiet: drop everything (your app already has its own
+// telemetry pipeline).
+LoroSyncPlugin({ doc, logger: silentLogger });
+
+// Custom: forward to Sentry / Datadog / Pino / etc.
+LoroSyncPlugin({
+  doc,
+  logger: {
+    error: (msg, ctx) => Sentry.captureException(ctx?.error, { tags: { msg } }),
+    warn: (msg, ctx) =>
+      Sentry.captureMessage(msg, { extra: ctx, level: "warning" }),
+    info: () => {},
+    debug: () => {},
+  },
+});
+```
+
+The same `logger` prop is supported on `LoroUndoPlugin`. When omitted,
+both plugins fall back to a built-in console logger filtered to `warn`.
+
 ### Custom `appendTransaction` plugins (no string hard-coding)
 
 If your editor needs an `appendTransaction` plugin that reacts to

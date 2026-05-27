@@ -116,7 +116,7 @@ export type LoroSyncEvent =
        *     (a diff kind it can't yet handle, an unmapped container, a
        *     schema-violating insert, …)
        *   - `translator-threw` — the translator raised; details are also
-       *     emitted to console.error.
+       *     emitted via the configured `logger.error` channel.
        *   - `checkout` — `event.by === "checkout"` is intentionally routed
        *     to the rebuild because checkout shapes can rewrite the doc.
        */
