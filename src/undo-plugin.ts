@@ -1,4 +1,4 @@
-import type { Cursor } from "loro-crdt";
+import type { Cursor, UndoManager as LoroUndoManager } from "loro-crdt";
 import { UndoManager } from "loro-crdt";
 import {
   type Command,
@@ -18,6 +18,15 @@ import {
 } from "./undo-plugin-key";
 
 type Cursors = { anchor: Cursor | null; focus: Cursor | null };
+
+/**
+ * Tracks `UndoManager`s that already have an active `LoroUndoPlugin`
+ * binding. Loro's `setOnPush` / `setOnPop` are single-slot — a second
+ * mount would silently steal the callbacks from the first. We detect
+ * the conflict here and warn loudly so consumers know to use one
+ * UndoManager per editor.
+ */
+const BOUND_UNDO_MANAGERS = new WeakSet<LoroUndoManager>();
 
 export const LoroUndoPlugin = (props: LoroUndoPluginProps): Plugin => {
   const undoManager = props.undoManager || new UndoManager(props.doc, {});
@@ -57,9 +66,17 @@ export const LoroUndoPlugin = (props: LoroUndoPluginProps): Plugin => {
         const isInternal =
           tr.getMeta(loroSyncPluginKey) != null ||
           tr.getMeta(loroUndoPluginKey) != null;
+        // Selection-only transactions (no docChanged) MUST NOT update
+        // prevSelection. If they did, an undo immediately following a
+        // mouse-click selection move would land at the click position
+        // rather than at the cursor's location before the last edit
+        // — which is what the user actually wants undone.
+        const isHistoryTracked = tr.getMeta("addToHistory") !== false;
+        const shouldCapture =
+          !isInternal && tr.docChanged && isHistoryTracked && loroState != null;
 
         let prevSelection = state.prevSelection;
-        if (loroState != null && !isInternal) {
+        if (shouldCapture) {
           // Capture the selection BEFORE this user transaction was applied,
           // so the next undo group can use it as the "where the cursor was
           // before the edit" anchor.
@@ -70,7 +87,16 @@ export const LoroUndoPlugin = (props: LoroUndoPluginProps): Plugin => {
           );
           prevSelection = { anchor: anchor ?? null, focus: focus ?? null };
         }
-        latestPrevSelection = prevSelection ?? { anchor: null, focus: null };
+        // Mirror only when we actually committed a new prevSelection.
+        // PM contract: apply must be pure — but factory-scoped
+        // `latestPrevSelection` IS observable side-effect. Restricting
+        // updates to history-tracked, doc-changing user transactions
+        // avoids polluting the mirror from speculative `state.apply`
+        // calls (e.g. Tiptap's `chain()` which runs apply against
+        // non-dispatched transactions).
+        if (shouldCapture) {
+          latestPrevSelection = prevSelection ?? { anchor: null, focus: null };
+        }
 
         const canUndo = state.undoManager.canUndo();
         const canRedo = state.undoManager.canRedo();
@@ -86,6 +112,20 @@ export const LoroUndoPlugin = (props: LoroUndoPluginProps): Plugin => {
     } as StateField<LoroUndoPluginState>,
 
     view: (view: EditorView) => {
+      // Detect double-mount of the same UndoManager. Loro's
+      // setOnPush/setOnPop are single-slot, so the second mount would
+      // silently break the first. We detect once and warn — but we
+      // still install our handlers (the user may have explicitly
+      // unmounted the first plugin and is replacing the binding).
+      if (BOUND_UNDO_MANAGERS.has(undoManager)) {
+        console.warn(
+          "[loro-prosemirror] LoroUndoPlugin: this UndoManager is already bound to another editor. " +
+            "Loro's setOnPush/setOnPop are single-slot, so the previous binding's cursor capture " +
+            "and selection restore will stop working. Use a separate UndoManager per editor.",
+        );
+      }
+      BOUND_UNDO_MANAGERS.add(undoManager);
+
       undoManager.setOnPush((isUndo, _counterRange) => {
         const loroState = loroSyncPluginKey.getState(view.state);
         if (loroState?.doc == null) {
@@ -140,6 +180,7 @@ export const LoroUndoPlugin = (props: LoroUndoPluginProps): Plugin => {
         destroy: () => {
           undoManager.setOnPop();
           undoManager.setOnPush();
+          BOUND_UNDO_MANAGERS.delete(undoManager);
         },
       };
     },
