@@ -175,6 +175,11 @@ export const createCursorPlugin = (
             // not bubble up: if they reach view.dispatch they'd tear the
             // editor down on every keystroke. Skip this awareness update;
             // the next selection change will retry.
+            loroState.onSyncEvent?.({
+              kind: "error",
+              phase: "cursor-encode",
+              error: e,
+            });
             console.warn(
               "[loro-prosemirror] cursor encode failed, skipping awareness update",
               e,
@@ -187,13 +192,15 @@ export const createCursorPlugin = (
             !cursorEq(current.focus, focus)
           ) {
             store.setLocal({
-              user: options.user,
+              user: options.user ?? current?.user,
               anchor,
               focus,
             });
           }
         } else if (current?.focus != null) {
-          store.setLocal({});
+          // Lost focus — clear cursor presence but PRESERVE the user
+          // metadata so name/color survive across blur/refocus cycles.
+          store.setLocal({ user: options.user ?? current?.user });
         }
       };
 
@@ -249,6 +256,15 @@ function createDecorations(
       loroState.mapping,
     );
     if (focus == null) {
+      // Decoding failed — peer's cursor anchored to a container we
+      // can't resolve (typically a transient mapping miss right after
+      // a remote insert). Surface via onSyncEvent for telemetry but
+      // don't render anything for this peer this frame.
+      loroState.onSyncEvent?.({
+        kind: "error",
+        phase: "cursor-decode",
+        error: new Error(`failed to decode focus cursor for peer ${peer}`),
+      });
       continue;
     }
     d.push(Decoration.widget(focus, createCursor(peer as PeerID)));
@@ -258,7 +274,15 @@ function createDecorations(
         doc as LoroDocType,
         loroState.mapping,
       );
+      // The focus widget has already been pushed above. If the anchor
+      // can't be decoded we still keep the caret visible for this peer
+      // — we just skip the selection-range decoration.
       if (anchor == null) {
+        loroState.onSyncEvent?.({
+          kind: "error",
+          phase: "cursor-decode",
+          error: new Error(`failed to decode anchor cursor for peer ${peer}`),
+        });
         continue;
       }
       d.push(

@@ -103,20 +103,32 @@ export function updateLoroToPmState(
   doc.commit({ origin: isInit ? "sys:init" : "loroSyncPlugin" });
 }
 
+/**
+ * Optional error sink for `createNodeFromLoroObj`. When the function
+ * fails to materialise a node (schema mismatch, invalid attrs, etc.)
+ * it normally logs to `console.error` and returns null/empty. Pass an
+ * `onError` callback to also receive the error programmatically — the
+ * sync plugin uses this to surface failures via `onSyncEvent`.
+ */
+export type CreateNodeErrorReporter = (error: unknown) => void;
+
 export function createNodeFromLoroObj(
   schema: Schema,
   obj: LoroNode,
   mapping: LoroNodeMapping,
+  onError?: CreateNodeErrorReporter,
 ): Node;
 export function createNodeFromLoroObj(
   schema: Schema,
   obj: LoroText,
   mapping: LoroNodeMapping,
+  onError?: CreateNodeErrorReporter,
 ): Node[];
 export function createNodeFromLoroObj(
   schema: Schema,
   obj: LoroNode | LoroText,
   mapping: LoroNodeMapping,
+  onError?: CreateNodeErrorReporter,
 ): Node | Node[] | null {
   let retval: Node | Node[] | null = mapping.get(obj.id) ?? null;
   if (retval != null) {
@@ -129,12 +141,16 @@ export function createNodeFromLoroObj(
 
     const nodeName = obj.get("nodeName");
     if (nodeName == null || typeof nodeName !== "string") {
-      throw new Error("Invalid nodeName");
+      const err = new Error("Invalid nodeName");
+      onError?.(err);
+      throw err;
     }
 
     const mappedChildren = children
       .toArray()
-      .flatMap((child) => createNodeFromLoroObj(schema, child as any, mapping))
+      .flatMap((child) =>
+        createNodeFromLoroObj(schema, child as any, mapping, onError),
+      )
       .filter((n) => n !== null);
 
     try {
@@ -143,6 +159,7 @@ export function createNodeFromLoroObj(
     } catch (e) {
       // An error occurred while creating the node.
       // This is probably a result of a concurrent action.
+      onError?.(e);
       console.error(e);
     }
   } else if (obj instanceof LoroText) {
@@ -162,6 +179,7 @@ export function createNodeFromLoroObj(
       } catch (e) {
         // An error occurred while creating the node.
         // This is probably a result of a concurrent action.
+        onError?.(e);
         console.error(e);
       }
     }
