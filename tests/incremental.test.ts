@@ -173,7 +173,12 @@ describe("loroEventBatchToTransaction (text)", () => {
     dispose();
 
     expect(batches.length).toBeGreaterThan(0);
-    const tr = loroEventBatchToTransaction(editorState, batches[0], mapping);
+    const tr = loroEventBatchToTransaction(
+      editorState,
+      batches[0],
+      mapping,
+      loroDoc,
+    );
     expect(tr).not.toBeNull();
     expect(tr!.docChanged).toBe(true);
 
@@ -194,7 +199,12 @@ describe("loroEventBatchToTransaction (text)", () => {
     await oneMs();
     dispose();
 
-    const tr = loroEventBatchToTransaction(editorState, batches[0], mapping);
+    const tr = loroEventBatchToTransaction(
+      editorState,
+      batches[0],
+      mapping,
+      loroDoc,
+    );
     expect(tr).not.toBeNull();
     const newState = editorState.apply(tr!);
     expect(newState.doc.child(0).textContent).toBe("Hello there world");
@@ -213,7 +223,12 @@ describe("loroEventBatchToTransaction (text)", () => {
     await oneMs();
     dispose();
 
-    const tr = loroEventBatchToTransaction(editorState, batches[0], mapping);
+    const tr = loroEventBatchToTransaction(
+      editorState,
+      batches[0],
+      mapping,
+      loroDoc,
+    );
     expect(tr).not.toBeNull();
     const newState = editorState.apply(tr!);
     expect(newState.doc.child(0).textContent).toBe("Hello");
@@ -232,7 +247,12 @@ describe("loroEventBatchToTransaction (text)", () => {
     await oneMs();
     dispose();
 
-    const tr = loroEventBatchToTransaction(editorState, batches[0], mapping);
+    const tr = loroEventBatchToTransaction(
+      editorState,
+      batches[0],
+      mapping,
+      loroDoc,
+    );
     expect(tr).not.toBeNull();
     const newState = editorState.apply(tr!);
     expect(newState.doc.child(0).textContent).toBe("Hello world");
@@ -265,6 +285,7 @@ describe("loroEventBatchToTransaction (text)", () => {
       stateWithSelection,
       batches[0],
       mapping,
+      loroDoc,
     );
     expect(tr).not.toBeNull();
     const newState = stateWithSelection.apply(tr!);
@@ -287,7 +308,12 @@ describe("loroEventBatchToTransaction (text)", () => {
     await oneMs();
     dispose();
 
-    const tr = loroEventBatchToTransaction(editorState, batches[0], mapping);
+    const tr = loroEventBatchToTransaction(
+      editorState,
+      batches[0],
+      mapping,
+      loroDoc,
+    );
     expect(tr).not.toBeNull();
     const newState = editorState.apply(tr!);
 
@@ -336,7 +362,12 @@ describe("loroEventBatchToTransaction (text)", () => {
     await oneMs();
     dispose();
 
-    const tr = loroEventBatchToTransaction(editorState, batches[0], mapping);
+    const tr = loroEventBatchToTransaction(
+      editorState,
+      batches[0],
+      mapping,
+      loroDoc,
+    );
     expect(tr).not.toBeNull();
     const newState = editorState.apply(tr!);
     const firstPara = newState.doc.child(0);
@@ -388,9 +419,232 @@ describe("loroEventBatchToTransaction (text)", () => {
     unsub();
 
     expect(batches.length).toBeGreaterThan(0);
-    const tr = loroEventBatchToTransaction(editorStateA, batches[0], mappingA);
+    const tr = loroEventBatchToTransaction(
+      editorStateA,
+      batches[0],
+      mappingA,
+      docA,
+    );
     expect(tr).not.toBeNull();
     const newState = editorStateA.apply(tr!);
     expect(newState.doc.child(0).textContent).toBe("Hello world from B");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 3: list & map diffs (block insert/delete, attribute changes)
+// ---------------------------------------------------------------------------
+
+describe("loroEventBatchToTransaction (list)", () => {
+  test("inserts a remote-added paragraph at the end of the doc", async () => {
+    const { loroDoc, editorState, mapping } = buildSyncedFixture(helloWorldDoc);
+    const { batches, dispose } = captureEvents(loroDoc);
+
+    const innerDoc = loroDoc.getMap(ROOT_DOC_KEY) as LoroNode;
+    const newPara = insertLoroMap(getLoroMapChildren(innerDoc), "paragraph");
+    const newText = insertLoroText(getLoroMapChildren(newPara));
+    newText.insert(0, "Third");
+    loroDoc.commit();
+    await oneMs();
+    dispose();
+
+    expect(batches.length).toBeGreaterThan(0);
+    const tr = loroEventBatchToTransaction(
+      editorState,
+      batches[0],
+      mapping,
+      loroDoc,
+    );
+    expect(tr).not.toBeNull();
+    const newState = editorState.apply(tr!);
+    expect(newState.doc.childCount).toBe(3);
+    expect(newState.doc.child(2).type.name).toBe("paragraph");
+    expect(newState.doc.child(2).textContent).toBe("Third");
+    // Existing paragraphs unchanged.
+    expect(newState.doc.child(0).textContent).toBe("Hello world");
+    expect(newState.doc.child(1).textContent).toBe("Second");
+  });
+
+  test("inserts a remote-added paragraph between existing paragraphs", async () => {
+    const { loroDoc, editorState, mapping } = buildSyncedFixture(helloWorldDoc);
+    const { batches, dispose } = captureEvents(loroDoc);
+
+    const innerDoc = loroDoc.getMap(ROOT_DOC_KEY) as LoroNode;
+    const docChildren = getLoroMapChildren(innerDoc);
+    // Insert at index 1 (between the two existing paragraphs).
+    const newPara = docChildren.insertContainer(1, new LoroMap()) as LoroNode;
+    newPara.set("nodeName", "paragraph");
+    getLoroMapChildren(newPara);
+    const attrs = newPara.getOrCreateContainer("attributes", new LoroMap());
+    void attrs;
+    const newText = insertLoroText(getLoroMapChildren(newPara));
+    newText.insert(0, "Middle");
+    loroDoc.commit();
+    await oneMs();
+    dispose();
+
+    const tr = loroEventBatchToTransaction(
+      editorState,
+      batches[0],
+      mapping,
+      loroDoc,
+    );
+    expect(tr).not.toBeNull();
+    const newState = editorState.apply(tr!);
+    expect(newState.doc.childCount).toBe(3);
+    expect(newState.doc.child(0).textContent).toBe("Hello world");
+    expect(newState.doc.child(1).textContent).toBe("Middle");
+    expect(newState.doc.child(2).textContent).toBe("Second");
+  });
+
+  test("deletes a remote-removed paragraph", async () => {
+    const { loroDoc, editorState, mapping } = buildSyncedFixture(helloWorldDoc);
+    const { batches, dispose } = captureEvents(loroDoc);
+
+    const innerDoc = loroDoc.getMap(ROOT_DOC_KEY) as LoroNode;
+    getLoroMapChildren(innerDoc).delete(0, 1);
+    loroDoc.commit();
+    await oneMs();
+    dispose();
+
+    const tr = loroEventBatchToTransaction(
+      editorState,
+      batches[0],
+      mapping,
+      loroDoc,
+    );
+    expect(tr).not.toBeNull();
+    const newState = editorState.apply(tr!);
+    expect(newState.doc.childCount).toBe(1);
+    expect(newState.doc.child(0).textContent).toBe("Second");
+  });
+
+  test("inserts a list item into an existing bulletList", async () => {
+    const fixture = {
+      type: "doc",
+      content: [
+        {
+          type: "bulletList",
+          content: [
+            {
+              type: "listItem",
+              content: [
+                {
+                  type: "paragraph",
+                  content: [{ type: "text", text: "One" }],
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    };
+    const { loroDoc, editorState, mapping } = buildSyncedFixture(fixture);
+    const { batches, dispose } = captureEvents(loroDoc);
+
+    const innerDoc = loroDoc.getMap(ROOT_DOC_KEY) as LoroNode;
+    const bulletList = getLoroMapChildren(innerDoc).get(0) as LoroNode;
+    const items = getLoroMapChildren(bulletList);
+    const newItem = insertLoroMap(items, "listItem");
+    const newPara = insertLoroMap(getLoroMapChildren(newItem), "paragraph");
+    const newText = insertLoroText(getLoroMapChildren(newPara));
+    newText.insert(0, "Two");
+    loroDoc.commit();
+    await oneMs();
+    dispose();
+
+    const tr = loroEventBatchToTransaction(
+      editorState,
+      batches[0],
+      mapping,
+      loroDoc,
+    );
+    expect(tr).not.toBeNull();
+    const newState = editorState.apply(tr!);
+    const list = newState.doc.child(0);
+    expect(list.type.name).toBe("bulletList");
+    expect(list.childCount).toBe(2);
+    expect(list.child(1).child(0).textContent).toBe("Two");
+  });
+});
+
+describe("loroEventBatchToTransaction (map)", () => {
+  test("translates an attribute change into setNodeMarkup", async () => {
+    const fixture = {
+      type: "doc",
+      content: [
+        {
+          type: "noteTitle",
+          attrs: { emoji: "🦜" },
+          content: [{ type: "text", text: "Title" }],
+        },
+        {
+          type: "paragraph",
+          content: [{ type: "text", text: "Body" }],
+        },
+      ],
+    };
+    const { loroDoc, editorState, mapping } = buildSyncedFixture(fixture);
+    const { batches, dispose } = captureEvents(loroDoc);
+
+    const innerDoc = loroDoc.getMap(ROOT_DOC_KEY) as LoroNode;
+    const titleBlock = getLoroMapChildren(innerDoc).get(0) as LoroNode;
+    const titleAttrs = titleBlock.getOrCreateContainer(
+      "attributes",
+      new LoroMap(),
+    );
+    titleAttrs.set("emoji", "🐦");
+    loroDoc.commit();
+    await oneMs();
+    dispose();
+
+    const tr = loroEventBatchToTransaction(
+      editorState,
+      batches[0],
+      mapping,
+      loroDoc,
+    );
+    expect(tr).not.toBeNull();
+    const newState = editorState.apply(tr!);
+    expect(newState.doc.child(0).attrs.emoji).toBe("🐦");
+    // Content of the title preserved.
+    expect(newState.doc.child(0).textContent).toBe("Title");
+  });
+
+  test("translates an attribute removal", async () => {
+    const fixture = {
+      type: "doc",
+      content: [
+        {
+          type: "noteTitle",
+          attrs: { emoji: "🦜" },
+          content: [{ type: "text", text: "Title" }],
+        },
+      ],
+    };
+    const { loroDoc, editorState, mapping } = buildSyncedFixture(fixture);
+    const { batches, dispose } = captureEvents(loroDoc);
+
+    const innerDoc = loroDoc.getMap(ROOT_DOC_KEY) as LoroNode;
+    const titleBlock = getLoroMapChildren(innerDoc).get(0) as LoroNode;
+    const titleAttrs = titleBlock.getOrCreateContainer(
+      "attributes",
+      new LoroMap(),
+    );
+    titleAttrs.delete("emoji");
+    loroDoc.commit();
+    await oneMs();
+    dispose();
+
+    const tr = loroEventBatchToTransaction(
+      editorState,
+      batches[0],
+      mapping,
+      loroDoc,
+    );
+    expect(tr).not.toBeNull();
+    const newState = editorState.apply(tr!);
+    // Schema default for emoji is "".
+    expect(newState.doc.child(0).attrs.emoji).toBe("");
   });
 });

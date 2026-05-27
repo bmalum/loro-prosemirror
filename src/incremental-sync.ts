@@ -1,15 +1,29 @@
-import type {
-  ContainerID,
-  Delta,
-  LoroEvent,
-  LoroEventBatch,
-  TextDiff,
-  Value,
+import {
+  type Container,
+  type ContainerID,
+  type Delta,
+  isContainer,
+  LoroList,
+  LoroMap,
+  type LoroEvent,
+  type LoroEventBatch,
+  type MapDiff,
+  type TextDiff,
+  type Value,
 } from "loro-crdt";
-import { type Mark, type Node, type Schema } from "prosemirror-model";
+import { Fragment, type Mark, type Node, type Schema } from "prosemirror-model";
 import { type EditorState, type Transaction } from "prosemirror-state";
 
-import { type LoroNodeMapping } from "./lib";
+import {
+  ATTRIBUTES_KEY,
+  CHILDREN_KEY,
+  createNodeFromLoroObj,
+  type LoroDocType,
+  type LoroNode,
+  type LoroNodeContainerType,
+  type LoroNodeMapping,
+  NODE_NAME_KEY,
+} from "./lib";
 
 /**
  * Information about where a Loro container resides in the ProseMirror tree.
@@ -39,11 +53,6 @@ export interface ContainerLocation {
  * a brand-new container has just arrived via a remote update and the parent
  * has not been re-walked. Callers should treat `null` as "cannot translate
  * incrementally" and fall back to a full document rebuild.
- *
- * The search is intentionally simple: a single `descendants` walk per
- * container. This is O(n) in the doc size, but in practice only a handful of
- * containers change per event batch and the cost is dwarfed by the cost of
- * the full rebuild it replaces.
  */
 export function findContainerLocation(
   doc: Node,
@@ -56,8 +65,6 @@ export function findContainerLocation(
   }
 
   if (Array.isArray(mapped)) {
-    // LoroText: the mapped value is the inline run of text nodes. They all
-    // live inside the same parent block; the run starts at the first one.
     if (mapped.length === 0) {
       return null;
     }
@@ -71,9 +78,6 @@ export function findContainerLocation(
       for (let i = 0; i < node.childCount; i++) {
         const child = node.child(i);
         if (child === firstText) {
-          // pos = position of `node`; pos + 1 = inside opening token;
-          // + offset accounts for siblings that precede the text run
-          // (e.g. an inline image or hard-break before the text).
           runStart = pos + 1 + offset;
           return false;
         }
@@ -87,7 +91,6 @@ export function findContainerLocation(
     return { node: mapped, pos: runStart, isText: true };
   }
 
-  // Non-text Node: search by reference identity.
   if (mapped === doc) {
     return { node: mapped, pos: 0, isText: false };
   }
@@ -116,24 +119,30 @@ export function findContainerLocation(
  * back to a full document replace in that case so the doc never diverges
  * from Loro.
  *
- * Currently implements:
- *   - `text` diffs (insert / delete / retain with mark attributes)
- *
- * Pending phases will add `list` (block insert/delete/move) and `map`
- * (attribute changes) translators.
+ * Implements `text` (Phase 2), `list` (block insert/delete/move) and `map`
+ * (attribute updates) diffs (Phase 3).
  */
 export function loroEventBatchToTransaction(
   state: EditorState,
   batch: LoroEventBatch,
   mapping: LoroNodeMapping,
+  doc: LoroDocType,
 ): Transaction | null {
   if (batch.events.length === 0) {
     return state.tr;
   }
 
   const tr = state.tr;
+  // Containers that are materialised into PM as part of a list-insert in
+  // this batch. Subsequent events that target any of them (or their
+  // descendants) are skipped because the materialised PM subtree already
+  // reflects the post-batch Loro state.
+  const materialisedInBatch = new Set<ContainerID>();
   for (const event of batch.events) {
-    const ok = applyEvent(tr, state, event, mapping);
+    if (materialisedInBatch.has(event.target)) {
+      continue;
+    }
+    const ok = applyEvent(tr, state, event, mapping, doc, materialisedInBatch);
     if (!ok) {
       return null;
     }
@@ -146,15 +155,33 @@ function applyEvent(
   state: EditorState,
   event: LoroEvent,
   mapping: LoroNodeMapping,
+  doc: LoroDocType,
+  materialisedInBatch: Set<ContainerID>,
 ): boolean {
   switch (event.diff.type) {
     case "text":
       return applyTextDiff(tr, state, event.target, event.diff, mapping);
+    case "list":
+      return applyListDiff(
+        tr,
+        state,
+        event.target,
+        event.diff,
+        mapping,
+        doc,
+        materialisedInBatch,
+      );
+    case "map":
+      return applyMapDiff(tr, state, event.target, event.diff, mapping, doc);
     default:
-      // list / map / tree / counter — not yet implemented. Caller falls back.
+      // tree / counter — not supported by this binding. Fall back.
       return false;
   }
 }
+
+// ---------------------------------------------------------------------------
+// Text
+// ---------------------------------------------------------------------------
 
 function applyTextDiff(
   tr: Transaction,
@@ -168,8 +195,6 @@ function applyTextDiff(
     return false;
   }
 
-  // Translate the run-start position from the pre-batch doc into the
-  // current (in-progress) tr.doc coordinate space.
   let cursor = tr.mapping.map(loc.pos);
 
   for (const op of diff.diff as Delta<string>[]) {
@@ -200,22 +225,13 @@ function applyTextDiff(
       cursor += op.insert.length;
     } else if (op.delete != null) {
       tr.delete(cursor, cursor + op.delete);
-      // cursor stays — the deleted region used to start at `cursor`.
     } else {
-      // Unknown delta op shape.
       return false;
     }
   }
   return true;
 }
 
-/**
- * Convert a Loro text-attribute map to PM marks.
- *
- * Returns `null` when the schema does not contain a referenced mark — in
- * that case the caller bails out and the safety-net rebuild handles the
- * event.
- */
 function attributesToMarks(
   schema: Schema,
   attributes: Record<string, Value | undefined>,
@@ -223,7 +239,6 @@ function attributesToMarks(
   const marks: Mark[] = [];
   for (const [name, raw] of Object.entries(attributes)) {
     if (raw == null) {
-      // A null attribute on `insert` means "no mark", which is the default.
       continue;
     }
     const markType = schema.marks[name];
@@ -236,14 +251,6 @@ function attributesToMarks(
   return marks;
 }
 
-/**
- * Apply a mark-attribute change over `[from, to)`.
- *
- * For each entry `[name, value]`:
- *   - `value === null` removes all marks of that type from the range
- *   - any other value adds the mark with the given attrs (replacing any
- *     prior mark of the same type by PM's mark-dedup rules).
- */
 function applyMarkAttributes(
   tr: Transaction,
   schema: Schema,
@@ -265,6 +272,303 @@ function applyMarkAttributes(
   }
   return true;
 }
+
+// ---------------------------------------------------------------------------
+// List (block-level edits on a parent's children list)
+// ---------------------------------------------------------------------------
+
+interface ListItemSnapshot {
+  /** ContainerID of this Loro child (or null when the child is a primitive). */
+  containerId: ContainerID | null;
+  /** PM offset of the start of this child relative to the parent's content. */
+  pmStart: number;
+  /** PM offset just past this child's content. */
+  pmEnd: number;
+}
+
+function applyListDiff(
+  tr: Transaction,
+  state: EditorState,
+  target: ContainerID,
+  diff: { type: "list"; diff: Delta<(Value | Container)[]>[] },
+  mapping: LoroNodeMapping,
+  doc: LoroDocType,
+  materialisedInBatch: Set<ContainerID>,
+): boolean {
+  const loroList = doc.getContainerById(target);
+  if (!(loroList instanceof LoroList)) {
+    return false;
+  }
+  const parentMap = loroList.parent();
+  if (!(parentMap instanceof LoroMap)) {
+    return false;
+  }
+  // Only translate edits on a block's children list — never on `data` etc.
+  if (parentMap.get(NODE_NAME_KEY) == null) {
+    return false;
+  }
+
+  const parentLoc = findContainerLocation(state.doc, parentMap.id, mapping);
+  if (parentLoc == null || parentLoc.isText) {
+    return false;
+  }
+  const parentNode = parentLoc.node as Node;
+  const parentPos = tr.mapping.map(parentLoc.pos);
+  // The root doc has no opening token, so its content starts AT `parentPos`
+  // (which is 0). Every other block's content starts at `parentPos + 1`,
+  // just past its opening token.
+  const isRootDoc = parentNode === state.doc;
+  const contentStart = isRootDoc ? parentPos : parentPos + 1;
+
+  // Snapshot the parent's pre-state children grouped per Loro child container.
+  const items = snapshotChildren(parentNode, mapping);
+  if (items == null) {
+    return false;
+  }
+
+  let listIdx = 0;
+  let pmCursor = 0; // offset within parent's content, post-applied-ops doc
+
+  for (const op of diff.diff) {
+    if (op.retain != null) {
+      for (let i = 0; i < op.retain; i++) {
+        if (listIdx >= items.length) {
+          return false;
+        }
+        const item = items[listIdx];
+        pmCursor += item.pmEnd - item.pmStart;
+        listIdx++;
+      }
+    } else if (op.delete != null) {
+      let removedSize = 0;
+      for (let i = 0; i < op.delete; i++) {
+        if (listIdx >= items.length) {
+          return false;
+        }
+        const item = items[listIdx];
+        removedSize += item.pmEnd - item.pmStart;
+        listIdx++;
+      }
+      if (removedSize > 0) {
+        tr.delete(
+          contentStart + pmCursor,
+          contentStart + pmCursor + removedSize,
+        );
+      }
+    } else if (op.insert != null) {
+      const inserted = op.insert as (Value | Container)[];
+      const fragments: Node[] = [];
+      for (const value of inserted) {
+        if (!isContainer(value)) {
+          // Block children must be containers in this binding.
+          return false;
+        }
+        const node = materializeInsertedContainer(state.schema, value, mapping);
+        if (node == null) {
+          return false;
+        }
+        // Mark this container — and every nested container we just bound
+        // into the mapping — as materialised in this batch, so that any
+        // later event targeting it is skipped. The PM subtree already
+        // reflects Loro's post-batch state.
+        collectContainerIds(value, materialisedInBatch);
+        if (Array.isArray(node)) {
+          for (const n of node) fragments.push(n);
+        } else {
+          fragments.push(node);
+        }
+      }
+      const fragment = Fragment.from(fragments);
+      tr.insert(contentStart + pmCursor, fragment);
+      pmCursor += fragment.size;
+    } else {
+      return false;
+    }
+  }
+  return true;
+}
+
+function collectContainerIds(
+  container: Container,
+  set: Set<ContainerID>,
+): void {
+  set.add(container.id);
+  if (container instanceof LoroMap) {
+    for (const key of container.keys()) {
+      const value = container.get(key);
+      if (isContainer(value)) {
+        collectContainerIds(value, set);
+      }
+    }
+  } else if (container instanceof LoroList) {
+    for (let i = 0; i < container.length; i++) {
+      const value = container.get(i);
+      if (isContainer(value)) {
+        collectContainerIds(value, set);
+      }
+    }
+  }
+}
+
+/**
+ * Walk a parent block's pre-state PM children and group them by the Loro
+ * container they map to. Consecutive PM text nodes that share a `LoroText`
+ * container are coalesced into a single snapshot entry, so the resulting
+ * list aligns 1:1 with the Loro `children` list.
+ *
+ * Returns `null` when a container can't be resolved — the caller bails to
+ * the full-replace fallback.
+ */
+function snapshotChildren(
+  parent: Node,
+  mapping: LoroNodeMapping,
+): ListItemSnapshot[] | null {
+  const items: ListItemSnapshot[] = [];
+  let offset = 0;
+  let i = 0;
+  while (i < parent.childCount) {
+    const child = parent.child(i);
+    if (child.isText) {
+      // Group consecutive text nodes into the LoroText container that owns
+      // the run.
+      const runStart = offset;
+      const runStartIdx = i;
+      while (i < parent.childCount && parent.child(i).isText) {
+        offset += parent.child(i).nodeSize;
+        i++;
+      }
+      const containerId = findTextContainerId(
+        mapping,
+        parent.child(runStartIdx),
+      );
+      items.push({
+        containerId,
+        pmStart: runStart,
+        pmEnd: offset,
+      });
+    } else {
+      const containerId = findBlockContainerId(mapping, child);
+      items.push({
+        containerId,
+        pmStart: offset,
+        pmEnd: offset + child.nodeSize,
+      });
+      offset += child.nodeSize;
+      i++;
+    }
+  }
+  return items;
+}
+
+function findTextContainerId(
+  mapping: LoroNodeMapping,
+  textNode: Node,
+): ContainerID | null {
+  for (const [id, value] of mapping) {
+    if (Array.isArray(value) && value.includes(textNode)) {
+      return id;
+    }
+  }
+  return null;
+}
+
+function findBlockContainerId(
+  mapping: LoroNodeMapping,
+  block: Node,
+): ContainerID | null {
+  for (const [id, value] of mapping) {
+    if (value === block) {
+      return id;
+    }
+  }
+  return null;
+}
+
+/**
+ * Materialise a container that has just been inserted into Loro into a PM
+ * Node (or array of text nodes for `LoroText`), populating the mapping with
+ * fresh bindings for it and any nested containers.
+ */
+function materializeInsertedContainer(
+  schema: Schema,
+  container: Container,
+  mapping: LoroNodeMapping,
+): Node | Node[] | null {
+  if (container instanceof LoroMap) {
+    return createNodeFromLoroObj(
+      schema,
+      container as LoroMap<LoroNodeContainerType>,
+      mapping,
+    );
+  }
+  // LoroText is the only other allowed inline container in this binding.
+  // We rely on createNodeFromLoroObj's overload to handle it.
+  return createNodeFromLoroObj(schema, container as never, mapping);
+}
+
+// ---------------------------------------------------------------------------
+// Map (attribute updates on a block's `attributes` sub-map)
+// ---------------------------------------------------------------------------
+
+function applyMapDiff(
+  tr: Transaction,
+  state: EditorState,
+  target: ContainerID,
+  diff: MapDiff,
+  mapping: LoroNodeMapping,
+  doc: LoroDocType,
+): boolean {
+  const container = doc.getContainerById(target);
+  if (!(container instanceof LoroMap)) {
+    return false;
+  }
+  const parent = container.parent();
+  if (!(parent instanceof LoroMap)) {
+    return false;
+  }
+  // We only handle map diffs on a block's `attributes` sub-map. Anything
+  // else (e.g. a nodeName change on the block itself, or an unrelated
+  // top-level map) falls back to the safety net.
+  if (parent.get(NODE_NAME_KEY) == null) {
+    return false;
+  }
+  const attrsContainer = parent.get(ATTRIBUTES_KEY);
+  if (!(attrsContainer instanceof LoroMap) || attrsContainer.id !== target) {
+    return false;
+  }
+
+  const blockLoc = findContainerLocation(state.doc, parent.id, mapping);
+  if (blockLoc == null || blockLoc.isText || Array.isArray(blockLoc.node)) {
+    return false;
+  }
+  const blockNode = blockLoc.node;
+  const blockPos = tr.mapping.map(blockLoc.pos);
+
+  const newAttrs: { [key: string]: unknown } = { ...blockNode.attrs };
+  for (const [key, raw] of Object.entries(diff.updated)) {
+    if (raw === undefined || raw === null) {
+      delete newAttrs[key];
+    } else if (isContainer(raw)) {
+      // Container-valued attrs aren't representable in the PM schema we
+      // target; bail to fallback.
+      return false;
+    } else {
+      newAttrs[key] = raw;
+    }
+  }
+
+  try {
+    tr.setNodeMarkup(blockPos, undefined, newAttrs);
+  } catch {
+    // Schema rejected the new attrs — bail.
+    return false;
+  }
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
 
 function valueToAttrs(value: Value): { [key: string]: unknown } | null {
   if (

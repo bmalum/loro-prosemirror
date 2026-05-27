@@ -212,7 +212,12 @@ function tryIncrementalSync(
   state: LoroSyncPluginState,
 ) {
   try {
-    return loroEventBatchToTransaction(view.state, event, state.mapping);
+    return loroEventBatchToTransaction(
+      view.state,
+      event,
+      state.mapping,
+      state.doc as LoroDocType,
+    );
   } catch (e) {
     console.error(
       "[loro-prosemirror] incremental sync failed, falling back to full replace:",
