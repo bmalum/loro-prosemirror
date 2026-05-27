@@ -84,3 +84,21 @@ import { loroEventBatchToTransaction } from "loro-prosemirror";
 const tr = loroEventBatchToTransaction(state, batch, mapping, doc);
 if (tr != null) view.dispatch(tr);
 ```
+
+### Observing sync events
+
+Wire `LoroSyncPluginProps.onSyncEvent` to surface incremental-vs-fallback
+metrics, fallback reasons, batch sizes etc. The hook is fired once per
+processed Loro event batch and is safe to throw from (errors are caught
+and logged):
+
+```ts
+LoroSyncPlugin({
+  doc,
+  onSyncEvent: (e) => {
+    if (e.kind === "fallback") {
+      console.warn("incremental bailed:", e.reason);
+    }
+  },
+});
+```

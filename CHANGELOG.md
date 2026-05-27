@@ -45,9 +45,26 @@ All notable changes to this project will be documented in this file. See [standa
 - The `applyTextDiff` empty-LoroText fallback now refuses
   `retain`/`delete` ops, since a fully-emptied pre-batch text run has
   nothing to retain or delete.
+- `loroEventBatchToTransaction`, `findContainerLocation` and
+  `findEmptyTextPosition` now return `null` on missing inputs instead
+  of throwing — the public API can be safely composed with custom
+  dispatchers.
+- The full-replace fallback no longer schedules a Loro-cursor restore
+  for `event.by === "checkout"` batches, since the local cursor is
+  semantically invalid after a version jump. Consumers using checkout
+  manage their own cursor placement.
 - Carry batch context (`by`, `origin`, event count, first target,
   first diff type) in the error log emitted when the translator
   throws — significantly easier to debug from production traces.
+
+### Observability
+
+- New optional `onSyncEvent` callback on `LoroSyncPluginProps`. Fired
+  once per processed event batch with `{ kind: "incremental" | "fallback",
+  eventCount, by, origin, … }`. The fallback variant carries a `reason`
+  field (`"translator-null" | "translator-threw" | "checkout"`) so
+  consumers can wire metrics, debug overlays, or dashboards. Hook
+  exceptions are caught and logged.
 
 ## [0.4.3](https://github.com/loro-dev/loro-prosemirror/compare/v0.4.2...v0.4.3) (2026-02-19)
 

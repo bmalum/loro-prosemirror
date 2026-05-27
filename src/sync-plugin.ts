@@ -20,6 +20,7 @@ import {
 } from "./lib";
 import {
   loroSyncPluginKey,
+  type LoroSyncEvent,
   type LoroSyncPluginProps,
   type LoroSyncPluginState,
 } from "./sync-plugin-key";
@@ -56,6 +57,7 @@ export const LoroSyncPlugin = (props: LoroSyncPluginProps): Plugin => {
           mapping: props.mapping ?? new Map(),
           changedBy: "local",
           containerId: props.containerId,
+          onSyncEvent: props.onSyncEvent,
         };
       },
       apply: (tr, state, oldEditorState, newEditorState) => {
@@ -191,33 +193,68 @@ function updateNodeOnLoroEvent(view: EditorView, event: LoroEventBatch) {
   //
   // When the translator returns null (or throws) we fall back to the legacy
   // full-document rebuild so the doc never diverges. This is the safety net.
-  const incrementalTr = tryIncrementalSync(view, event, state);
+  const { tr: incrementalTr, threw } = tryIncrementalSync(view, event, state);
   if (incrementalTr != null) {
     incrementalTr.setMeta(loroSyncPluginKey, { type: "non-local-updates" });
     view.dispatch(incrementalTr);
+    emitSyncEvent(state, {
+      kind: "incremental",
+      eventCount: event.events.length,
+      by: event.by,
+      origin: event.origin,
+    });
     return;
   }
 
+  emitSyncEvent(state, {
+    kind: "fallback",
+    reason: threw
+      ? "translator-threw"
+      : event.by === "checkout"
+        ? "checkout"
+        : "translator-null",
+    eventCount: event.events.length,
+    by: event.by,
+    origin: event.origin,
+  });
   fullReplaceFallback(view, event, state);
 }
 
 /**
+ * Notify the consumer's `onSyncEvent` hook, if any. A throwing hook is
+ * never allowed to break the dispatch flow.
+ */
+function emitSyncEvent(state: LoroSyncPluginState, info: LoroSyncEvent) {
+  const hook = state.onSyncEvent;
+  if (hook == null) {
+    return;
+  }
+  try {
+    hook(info);
+  } catch (e) {
+    console.error("[loro-prosemirror] onSyncEvent hook threw:", e);
+  }
+}
+
+/**
  * Attempt to build an incremental ProseMirror transaction from a Loro event
- * batch. Errors are caught and reported once; the caller treats `null` as
- * "use the full-replace fallback".
+ * batch. The boolean `threw` lets the caller distinguish a bail-because-
+ * unsupported (`null`, `threw=false`) from a bail-because-error
+ * (`null`, `threw=true`) so the metrics hook can report the reason.
  */
 function tryIncrementalSync(
   view: EditorView,
   event: LoroEventBatch,
   state: LoroSyncPluginState,
-) {
+): { tr: ReturnType<typeof loroEventBatchToTransaction>; threw: boolean } {
   try {
-    return loroEventBatchToTransaction(
+    const tr = loroEventBatchToTransaction(
       view.state,
       event,
       state.mapping,
       state.doc as LoroDocType,
     );
+    return { tr, threw: false };
   } catch (e) {
     console.error(
       "[loro-prosemirror] incremental sync threw, falling back to full replace.",
@@ -230,7 +267,7 @@ function tryIncrementalSync(
         firstDiffType: event.events[0]?.diff.type,
       },
     );
-    return null;
+    return { tr: null, threw: true };
   }
 }
 
@@ -256,11 +293,17 @@ function fullReplaceFallback(
       : (state.doc as LoroDocType).getMap(ROOT_DOC_KEY),
     mapping,
   );
-  const { anchor, focus } = convertPmSelectionToCursors(
-    view.state.doc,
-    view.state.selection,
-    state,
-  );
+
+  // Only capture the local cursor when there's a meaningful chance we
+  // can re-anchor it after the rebuild. For `checkout` batches the user
+  // is intentionally jumping to a different document version — the local
+  // cursor is no longer semantically valid, so we leave PM's natural
+  // selection mapping to handle the position. Consumers using checkout
+  // typically manage their own cursor placement.
+  const captureCursor = event.by !== "checkout";
+  const { anchor, focus } = captureCursor
+    ? convertPmSelectionToCursors(view.state.doc, view.state.selection, state)
+    : { anchor: undefined, focus: undefined };
 
   const tr = view.state.tr.replace(
     0,

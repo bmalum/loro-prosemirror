@@ -60,6 +60,9 @@ export function findContainerLocation(
   containerId: ContainerID,
   mapping: LoroNodeMapping,
 ): ContainerLocation | null {
+  if (doc == null || containerId == null || mapping == null) {
+    return null;
+  }
   const mapped = mapping.get(containerId);
   if (mapped == null) {
     return null;
@@ -139,6 +142,9 @@ export function findEmptyTextPosition(
   mapping: LoroNodeMapping,
   loroDoc: LoroDocType,
 ): number | null {
+  if (pmDoc == null || textId == null || mapping == null || loroDoc == null) {
+    return null;
+  }
   const text = loroDoc.getContainerById(textId);
   if (!(text instanceof LoroText)) {
     return null;
@@ -214,6 +220,15 @@ export function loroEventBatchToTransaction(
   mapping: LoroNodeMapping,
   doc: LoroDocType,
 ): Transaction | null {
+  // Defensive null-checks. The plugin only ever calls this with a
+  // well-formed batch from a real Loro subscription, but power users
+  // are encouraged to compose this translator with their own dispatch
+  // layer — return null gracefully on malformed input rather than
+  // throwing a TypeError and crashing their fallback handler.
+  if (batch == null || batch.events == null) {
+    return null;
+  }
+
   // Checkout events can carry diffs that essentially rewrite the document
   // (e.g. timeline scrubbing in a history viewer). Until we benchmark
   // them, route all checkouts through the safety-net rebuild. This check

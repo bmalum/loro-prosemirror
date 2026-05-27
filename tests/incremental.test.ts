@@ -1438,3 +1438,115 @@ describe("loroEventBatchToTransaction (review #2 fixes)", () => {
     expect(tr).toBeNull();
   });
 });
+
+// ---------------------------------------------------------------------------
+// Review #3 fixes: defensive API, no-default-writeback, metrics hook
+// ---------------------------------------------------------------------------
+
+describe("loroEventBatchToTransaction (review #3 fixes)", () => {
+  test("returns null gracefully on a null/undefined batch", () => {
+    const { loroDoc, editorState, mapping } = buildSyncedFixture(helloWorldDoc);
+    expect(
+      loroEventBatchToTransaction(
+        editorState,
+        null as unknown as LoroEventBatch,
+        mapping,
+        loroDoc,
+      ),
+    ).toBeNull();
+    expect(
+      loroEventBatchToTransaction(
+        editorState,
+        undefined as unknown as LoroEventBatch,
+        mapping,
+        loroDoc,
+      ),
+    ).toBeNull();
+    expect(
+      loroEventBatchToTransaction(
+        editorState,
+        { by: "import" } as unknown as LoroEventBatch,
+        mapping,
+        loroDoc,
+      ),
+    ).toBeNull();
+  });
+
+  test("findContainerLocation returns null on missing inputs", async () => {
+    const { editorState, mapping } = buildSyncedFixture(helloWorldDoc);
+    const { findContainerLocation } = await import("../src/incremental-sync");
+    expect(
+      findContainerLocation(
+        null as unknown as import("prosemirror-model").Node,
+        "cid:0@1:Map" as never,
+        mapping,
+      ),
+    ).toBeNull();
+    expect(
+      findContainerLocation(editorState.doc, null as unknown as never, mapping),
+    ).toBeNull();
+  });
+
+  test("a doc-changed round-trip after incremental sync writes nothing back to Loro", async () => {
+    // Pin the contract that `updateLoroToPmState` is idempotent on
+    // already-synced state. If a future change starts writing schema
+    // defaults back to Loro on every dispatch, this test will fail and
+    // surface the bloat.
+    const fixture = {
+      type: "doc",
+      content: [
+        {
+          type: "noteTitle",
+          attrs: { emoji: "🦜" },
+          content: [{ type: "text", text: "T" }],
+        },
+        {
+          type: "paragraph",
+          content: [{ type: "text", text: "P" }],
+        },
+      ],
+    };
+    const { loroDoc } = buildSyncedFixture(fixture);
+
+    const before = JSON.parse(JSON.stringify(loroDoc.toJSON()));
+
+    // Simulate the apply step that would run after an incremental tr
+    // lands: re-walk Loro vs PM via `updateLoroToPmState`.
+    const innerDoc = loroDoc.getMap(ROOT_DOC_KEY) as LoroNode;
+    const seedNode = createNodeFromLoroObj(
+      schema,
+      innerDoc as LoroMap<LoroNodeContainerType>,
+      new Map(),
+    );
+    const stateAfterIncremental = createEditorState(schema, seedNode.toJSON());
+    updateLoroToPmState(loroDoc, new Map(), stateAfterIncremental);
+
+    const after = JSON.parse(JSON.stringify(loroDoc.toJSON()));
+    expect(after).toEqual(before);
+  });
+
+  test("LoroSyncPlugin propagates onSyncEvent into plugin state", async () => {
+    const { LoroSyncPlugin } = await import("../src/sync-plugin");
+    const { EditorState } = await import("prosemirror-state");
+    const calls: import("../src/sync-plugin-key").LoroSyncEvent[] = [];
+    const loroDoc: LoroDocType = new LoroDoc();
+    const plugin = LoroSyncPlugin({
+      doc: loroDoc,
+      onSyncEvent: (e) => calls.push(e),
+    });
+    const state = EditorState.create({ schema, plugins: [plugin] });
+    const pluginState = (
+      await import("../src/sync-plugin-key")
+    ).loroSyncPluginKey.getState(state);
+    expect(pluginState).toBeDefined();
+    expect(pluginState!.onSyncEvent).toBeDefined();
+    // Confirm the hook reference round-trips
+    pluginState!.onSyncEvent!({
+      kind: "incremental",
+      eventCount: 1,
+      by: "import",
+    });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toMatchObject({ kind: "incremental", eventCount: 1 });
+  });
+});

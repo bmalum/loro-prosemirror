@@ -1,6 +1,7 @@
 export { LoroSyncPlugin } from "./sync-plugin";
 export {
   loroSyncPluginKey,
+  type LoroSyncEvent,
   type LoroSyncPluginProps,
   type LoroSyncPluginState,
 } from "./sync-plugin-key";
