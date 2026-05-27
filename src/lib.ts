@@ -157,10 +157,16 @@ export function createNodeFromLoroObj(
       retval = schema.node(nodeName, attributes.toJSON(), mappedChildren);
       WEAK_NODE_TO_LORO_CONTAINER_MAPPING.set(retval, obj.id);
     } catch (e) {
-      // An error occurred while creating the node.
-      // This is probably a result of a concurrent action.
-      onError?.(e);
-      console.error(e);
+      // An error occurred while creating the node — typically a result
+      // of a concurrent action or a schema/Loro divergence. If an
+      // `onError` was supplied we route the error there exclusively;
+      // otherwise we fall back to console.error so problems are still
+      // visible to consumers that haven't wired the callback.
+      if (onError != null) {
+        onError(e);
+      } else {
+        console.error(e);
+      }
     }
   } else if (obj instanceof LoroText) {
     retval = [];
@@ -177,10 +183,13 @@ export function createNodeFromLoroObj(
         }
         retval.push(schema.text(delta.insert, marks));
       } catch (e) {
-        // An error occurred while creating the node.
-        // This is probably a result of a concurrent action.
-        onError?.(e);
-        console.error(e);
+        // An error occurred while creating the node — typically a
+        // schema/Loro divergence. Same routing rule as above.
+        if (onError != null) {
+          onError(e);
+        } else {
+          console.error(e);
+        }
       }
     }
   } else {

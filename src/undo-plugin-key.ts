@@ -1,5 +1,6 @@
 import type { Cursor, LoroDoc, UndoManager } from "loro-crdt";
 import { PluginKey } from "prosemirror-state";
+import type { LoroLogger } from "./logger";
 
 export const loroUndoPluginKey = new PluginKey<LoroUndoPluginState>(
   "loro-undo",
@@ -8,6 +9,11 @@ export const loroUndoPluginKey = new PluginKey<LoroUndoPluginState>(
 export interface LoroUndoPluginProps {
   doc: LoroDoc;
   undoManager?: UndoManager;
+  /**
+   * Optional structured logger. When omitted, the plugin uses a
+   * built-in console logger that prints `error` and `warn` only.
+   */
+  logger?: LoroLogger;
 }
 
 export interface LoroUndoPluginState {

@@ -26,6 +26,7 @@ import {
 } from "./sync-plugin-key";
 import { configLoroTextStyle } from "./text-style";
 import { loroUndoPluginKey } from "./undo-plugin-key";
+import { defaultLogger, type LoroLogger } from "./logger";
 
 type PluginTransactionType =
   | { type: "doc-changed" }
@@ -64,6 +65,7 @@ export const LoroSyncPlugin = (props: LoroSyncPluginProps): Plugin => {
           containerId: props.containerId,
           onSyncEvent: props.onSyncEvent,
           disableFallbackCursorRestore: props.disableFallbackCursorRestore,
+          logger: props.logger ?? defaultLogger,
         };
       },
       apply: (
@@ -97,15 +99,16 @@ export const LoroSyncPlugin = (props: LoroSyncPluginProps): Plugin => {
                   newEditorState,
                   state.containerId,
                 );
+                getLogger(state).debug("doc-changed: PM->Loro write");
               } catch (e) {
                 emitSyncEvent(state, {
                   kind: "error",
                   phase: "doc-changed",
                   error: e,
                 });
-                console.error(
-                  "[loro-prosemirror] updateLoroToPmState threw, doc may diverge until next event:",
-                  e,
+                getLogger(state).error(
+                  "updateLoroToPmState threw, doc may diverge until next event",
+                  { error: e },
                 );
               }
             }
@@ -128,7 +131,7 @@ export const LoroSyncPlugin = (props: LoroSyncPluginProps): Plugin => {
                   phase: "update-state",
                   error: e,
                 });
-                console.error("[loro-prosemirror] sys:init commit threw:", e);
+                getLogger(next).error("sys:init commit threw", { error: e });
               }
             }
             return next;
@@ -176,9 +179,9 @@ export const LoroSyncPlugin = (props: LoroSyncPluginProps): Plugin => {
         if (state != null) {
           emitSyncEvent(state, { kind: "error", phase: "init", error: e });
         }
-        console.error(
-          "[loro-prosemirror] init threw, editor mounted unsynced:",
-          e,
+        (state?.logger ?? defaultLogger).error(
+          "init threw, editor mounted unsynced",
+          { error: e },
         );
       }
       return {
@@ -358,8 +361,17 @@ function updateNodeOnLoroEvent(view: EditorView, event: LoroEventBatch) {
     // Our own write that doesn't come from an undo replay. The PM dispatch
     // that produced this Loro change has already updated the editor; we
     // don't need to round-trip it back into PM.
+    getLogger(state).debug("skip own local non-undo event", {
+      origin: event.origin,
+      eventCount: event.events.length,
+    });
     return;
   }
+  getLogger(state).debug("processing Loro event batch", {
+    by: event.by,
+    origin: event.origin,
+    eventCount: event.events.length,
+  });
 
   // First try to translate the event batch into surgical PM Steps. When the
   // translation succeeds we dispatch a single transaction and rely on PM's
@@ -400,6 +412,15 @@ function updateNodeOnLoroEvent(view: EditorView, event: LoroEventBatch) {
 }
 
 /**
+ * Resolve the logger for a given plugin state. Falls back to the
+ * default console logger if the state predates the logger field
+ * (defensive — should never fire in practice).
+ */
+function getLogger(state: LoroSyncPluginState): LoroLogger {
+  return state.logger ?? defaultLogger;
+}
+
+/**
  * Notify the consumer's `onSyncEvent` hook, if any. A throwing hook is
  * never allowed to break the dispatch flow.
  */
@@ -411,7 +432,7 @@ function emitSyncEvent(state: LoroSyncPluginState, info: LoroSyncEvent) {
   try {
     hook(info);
   } catch (e) {
-    console.error("[loro-prosemirror] onSyncEvent hook threw:", e);
+    getLogger(state).error("onSyncEvent hook threw", { error: e });
   }
 }
 
@@ -435,8 +456,8 @@ function tryIncrementalSync(
     );
     return { tr, threw: false };
   } catch (e) {
-    console.error(
-      "[loro-prosemirror] incremental sync threw, falling back to full replace.",
+    getLogger(state).error(
+      "incremental sync threw, falling back to full replace",
       {
         error: e,
         batchBy: event.by,

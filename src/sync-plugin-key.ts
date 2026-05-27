@@ -2,6 +2,7 @@ import type { ContainerID, LoroDoc, Subscription } from "loro-crdt";
 import { PluginKey, type Transaction } from "prosemirror-state";
 import type { EditorView } from "prosemirror-view";
 import type { LoroDocType, LoroNodeMapping } from "./lib";
+import type { LoroLogger } from "./logger";
 
 export const loroSyncPluginKey = new PluginKey<LoroSyncPluginState>(
   "loro-sync",
@@ -181,12 +182,29 @@ export interface LoroSyncPluginProps {
    * host's `appendTransaction` and overrides its selection.
    */
   disableFallbackCursorRestore?: boolean;
+  /**
+   * Optional structured logger. When omitted, the plugin uses a
+   * built-in console logger that prints `error` and `warn` only.
+   * Pass `createConsoleLogger("debug")` to enable verbose tracing,
+   * or your own implementation to forward to a structured backend
+   * (Sentry, Datadog, Pino, etc.).
+   */
+  logger?: LoroLogger;
 }
 
 export interface LoroSyncPluginState extends LoroSyncPluginProps {
   changedBy: "local" | "import" | "checkout";
   mapping: LoroNodeMapping;
+  /**
+   * @deprecated Reserved for a future read-only snapshot mode. Currently
+   * always null after init; the `editable` plugin prop returns true
+   * regardless. Do not depend on this field — it may be removed in a
+   * future major.
+   */
   snapshot?: LoroDoc | null;
+  /**
+   * @deprecated Never written by the plugin. Slated for removal.
+   */
   view?: EditorView;
   containerId?: ContainerID;
   docSubscription?: Subscription | null;

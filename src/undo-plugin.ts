@@ -16,6 +16,7 @@ import {
   type LoroUndoPluginProps,
   type LoroUndoPluginState,
 } from "./undo-plugin-key";
+import { defaultLogger } from "./logger";
 
 type Cursors = { anchor: Cursor | null; focus: Cursor | null };
 
@@ -59,6 +60,7 @@ function detectCompetingHistoryPlugin(
 export const LoroUndoPlugin = (props: LoroUndoPluginProps): Plugin => {
   const undoManager = props.undoManager || new UndoManager(props.doc, {});
   undoManager.addExcludeOriginPrefix("sys:init");
+  const logger = props.logger ?? defaultLogger;
 
   // Closure mirror of the latest `prevSelection` computed by `apply()`.
   // The Loro `setOnPush` callback fires synchronously inside the apply
@@ -146,10 +148,11 @@ export const LoroUndoPlugin = (props: LoroUndoPluginProps): Plugin => {
       // still install our handlers (the user may have explicitly
       // unmounted the first plugin and is replacing the binding).
       if (BOUND_UNDO_MANAGERS.has(undoManager)) {
-        console.warn(
-          "[loro-prosemirror] LoroUndoPlugin: this UndoManager is already bound to another editor. " +
-            "Loro's setOnPush/setOnPop are single-slot, so the previous binding's cursor capture " +
-            "and selection restore will stop working. Use a separate UndoManager per editor.",
+        logger.warn(
+          "LoroUndoPlugin: this UndoManager is already bound to another editor. " +
+            "Loro's setOnPush/setOnPop are single-slot, so the previous binding's " +
+            "cursor capture and selection restore will stop working. " +
+            "Use a separate UndoManager per editor.",
         );
       }
       BOUND_UNDO_MANAGERS.add(undoManager);
@@ -170,15 +173,13 @@ export const LoroUndoPlugin = (props: LoroUndoPluginProps): Plugin => {
       // calling our `undo`/`redo` and rely on PM history alone.
       const competingHistoryName = detectCompetingHistoryPlugin(view.state);
       if (competingHistoryName != null) {
-        console.warn(
-          `[loro-prosemirror] LoroUndoPlugin: a competing PM history plugin ` +
-            `("${competingHistoryName}") is mounted in the same EditorState. ` +
-            `Both will intercept undo independently; calling LoroUndoPlugin's ` +
-            `\`undo\`/\`redo\` while the other plugin is also active causes ` +
-            `desynchronization between PM history and the Loro op log. ` +
+        logger.warn(
+          `LoroUndoPlugin: a competing PM history plugin ("${competingHistoryName}") ` +
+            `is mounted in the same EditorState. Both will intercept undo independently; ` +
+            `calling LoroUndoPlugin's \`undo\`/\`redo\` while the other plugin is also active ` +
+            `causes desynchronization between PM history and the Loro op log. ` +
             `Either disable the competing history plugin (e.g. ` +
-            `StarterKit.configure({ history: false })) or do not call ` +
-            `LoroUndoPlugin's commands.`,
+            `StarterKit.configure({ history: false })) or do not call LoroUndoPlugin's commands.`,
         );
       }
 

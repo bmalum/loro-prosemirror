@@ -25,6 +25,7 @@ import {
   loroSyncPluginKey,
   type LoroSyncPluginState,
 } from "../sync-plugin-key";
+import { defaultLogger } from "../logger";
 
 export type CursorUser = { name: string; color: string };
 export type CursorPresenceState = {
@@ -180,9 +181,9 @@ export const createCursorPlugin = (
               phase: "cursor-encode",
               error: e,
             });
-            console.warn(
-              "[loro-prosemirror] cursor encode failed, skipping awareness update",
-              e,
+            (loroState.logger ?? defaultLogger).warn(
+              "cursor encode failed, skipping awareness update",
+              { error: e },
             );
             return;
           }
