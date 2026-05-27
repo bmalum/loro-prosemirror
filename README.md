@@ -53,3 +53,34 @@ const plugins = [
   // see above for other plugins
 ];
 ```
+
+## Incremental sync
+
+`LoroSyncPlugin` translates each remote `LoroEventBatch` into a single
+ProseMirror `Transaction` made of surgical steps:
+
+| Loro diff                                           | ProseMirror step                                   |
+| --------------------------------------------------- | -------------------------------------------------- |
+| `LoroText` insert / delete                          | `ReplaceStep` over the affected range              |
+| `LoroText` retain with attribute changes            | `AddMarkStep` / `RemoveMarkStep`                   |
+| `LoroList` insert / delete on a children list       | `ReplaceStep` with the materialised block fragment |
+| `LoroMap` updates on a block's `attributes` sub-map | `setNodeMarkup`                                    |
+
+This means a remote keystroke costs O(edit_size), not O(doc_size), and
+ProseMirror's built-in selection mapping keeps the local cursor, selection,
+node views and decorations stable across remote updates — no manual
+cursor-restore dance is required.
+
+If a batch contains a diff this binding can't translate (currently `tree` and
+`counter`, or events that reference an unknown mark in the schema), the
+plugin transparently falls back to the legacy full-document rebuild, so the
+ProseMirror doc never diverges from Loro.
+
+The translator is also exposed for advanced consumers:
+
+```ts
+import { loroEventBatchToTransaction } from "loro-prosemirror";
+
+const tr = loroEventBatchToTransaction(state, batch, mapping, doc);
+if (tr != null) view.dispatch(tr);
+```

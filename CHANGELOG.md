@@ -2,6 +2,23 @@
 
 All notable changes to this project will be documented in this file. See [standard-version](https://github.com/conventional-changelog/standard-version) for commit guidelines.
 
+## Unreleased
+
+### Features
+
+- Incremental sync. `LoroSyncPlugin` now translates each remote
+  `LoroEventBatch` into a single ProseMirror `Transaction` of surgical
+  steps (`ReplaceStep`, `AddMarkStep`, `RemoveMarkStep`, `setNodeMarkup`)
+  instead of rebuilding the document on every remote update. The local
+  cursor, selection, node views and decorations are preserved
+  automatically by ProseMirror's selection mapping. The legacy full-
+  document rebuild is retained as a safety net for diff kinds the
+  translator doesn't yet handle (`tree`, `counter`, mark names absent
+  from the schema), so the ProseMirror doc never diverges from Loro.
+- Export `loroEventBatchToTransaction` and `findContainerLocation` for
+  advanced consumers that want to compose the translator with their own
+  view layer.
+
 ## [0.4.3](https://github.com/loro-dev/loro-prosemirror/compare/v0.4.2...v0.4.3) (2026-02-19)
 
 

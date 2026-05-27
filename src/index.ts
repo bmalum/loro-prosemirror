@@ -19,6 +19,11 @@ export {
   type LoroContainer,
   type LoroType,
 } from "./lib";
+export {
+  findContainerLocation,
+  loroEventBatchToTransaction,
+  type ContainerLocation,
+} from "./incremental-sync";
 export type {
   CursorPluginOptions,
   CursorPresenceState,

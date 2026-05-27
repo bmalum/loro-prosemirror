@@ -649,7 +649,6 @@ describe("loroEventBatchToTransaction (map)", () => {
   });
 });
 
-
 // ---------------------------------------------------------------------------
 // Phase 4: edge cases (nested + concurrent + missing mapping + roundtrip)
 // ---------------------------------------------------------------------------
@@ -918,9 +917,10 @@ describe("loroEventBatchToTransaction (edge cases)", () => {
           fellBackTextEdits++;
         } else {
           editorStateA = editorStateA.apply(tr);
-          mappingA = rebindMapping(editorStateA.doc, docA.getMap(
-            ROOT_DOC_KEY,
-          ) as LoroNode);
+          mappingA = rebindMapping(
+            editorStateA.doc,
+            docA.getMap(ROOT_DOC_KEY) as LoroNode,
+          );
           incrementalApplied++;
         }
       }
