@@ -54,15 +54,38 @@ export interface ContainerLocation {
  * has not been re-walked, or when a `LoroText` has been emptied and pruned
  * from the mapping by `updateLoroToPmState`. Callers handling text events
  * should fall back to {@link findEmptyTextPosition} in that case.
+ *
+ * Pass an optional `cache` to memoise lookups across an event batch — the
+ * walk over `doc.descendants` is O(N) per call, so without a cache a
+ * batch of M events on a doc of size N is O(N·M).
  */
 export function findContainerLocation(
   doc: Node,
   containerId: ContainerID,
   mapping: LoroNodeMapping,
+  cache?: Map<ContainerID, ContainerLocation | null>,
 ): ContainerLocation | null {
   if (doc == null || containerId == null || mapping == null) {
     return null;
   }
+  if (cache != null) {
+    const cached = cache.get(containerId);
+    if (cached !== undefined) {
+      return cached;
+    }
+  }
+  const result = findContainerLocationUncached(doc, containerId, mapping);
+  if (cache != null) {
+    cache.set(containerId, result);
+  }
+  return result;
+}
+
+function findContainerLocationUncached(
+  doc: Node,
+  containerId: ContainerID,
+  mapping: LoroNodeMapping,
+): ContainerLocation | null {
   const mapped = mapping.get(containerId);
   if (mapped == null) {
     return null;
@@ -250,8 +273,14 @@ export function loroEventBatchToTransaction(
   // Parent block ContainerIDs whose children list was mutated by some
   // earlier event in the batch (insert or delete). We use this to guard
   // findEmptyTextPosition, which only computes a correct offset when
-  // the parent's children list has not been touched in this batch.
+  // neither the parent nor any ancestor's children list has been touched
+  // in this batch (a sibling/ancestor mutation shifts pre-batch PM
+  // coordinates that the parent-walk relies on).
   const parentTouchedInBatch = new Set<ContainerID>();
+  // Memoise findContainerLocation across the batch — without this it is
+  // O(doc_size) per event and a 50-event batch on a 5KB doc is 250K
+  // descendant visits.
+  const locationCache = new Map<ContainerID, ContainerLocation | null>();
 
   for (const event of batch.events) {
     if (materialisedInBatch.has(event.target)) {
@@ -265,6 +294,7 @@ export function loroEventBatchToTransaction(
       doc,
       materialisedInBatch,
       parentTouchedInBatch,
+      locationCache,
     );
     if (!ok) {
       return null;
@@ -281,6 +311,7 @@ function applyEvent(
   doc: LoroDocType,
   materialisedInBatch: Set<ContainerID>,
   parentTouchedInBatch: Set<ContainerID>,
+  locationCache: Map<ContainerID, ContainerLocation | null>,
 ): boolean {
   switch (event.diff.type) {
     case "text":
@@ -292,6 +323,7 @@ function applyEvent(
         mapping,
         doc,
         parentTouchedInBatch,
+        locationCache,
       );
     case "list":
       return applyListDiff(
@@ -303,9 +335,18 @@ function applyEvent(
         doc,
         materialisedInBatch,
         parentTouchedInBatch,
+        locationCache,
       );
     case "map":
-      return applyMapDiff(tr, state, event.target, event.diff, mapping, doc);
+      return applyMapDiff(
+        tr,
+        state,
+        event.target,
+        event.diff,
+        mapping,
+        doc,
+        locationCache,
+      );
     default:
       // tree / counter — not used by this binding.
       return false;
@@ -324,8 +365,9 @@ function applyTextDiff(
   mapping: LoroNodeMapping,
   doc: LoroDocType,
   parentTouchedInBatch: Set<ContainerID>,
+  locationCache: Map<ContainerID, ContainerLocation | null>,
 ): boolean {
-  const loc = findContainerLocation(state.doc, target, mapping);
+  const loc = findContainerLocation(state.doc, target, mapping, locationCache);
   let prePos: number;
   let usedFallback = false;
   if (loc != null && loc.isText) {
@@ -334,18 +376,13 @@ function applyTextDiff(
     // Mapping miss: typical when the LoroText was emptied earlier in this
     // session and `updateLoroToPmState` pruned the entry. Walk to the
     // parent block to recover the insertion point — but only when no
-    // sibling was added/removed in THIS batch (see
+    // ancestor's children list was mutated in THIS batch (see
     // findEmptyTextPosition's docs for why).
     const text = doc.getContainerById(target);
     if (!(text instanceof LoroText)) {
       return false;
     }
-    const parentList = text.parent();
-    const parentBlock = parentList?.parent();
-    if (
-      parentBlock instanceof LoroMap &&
-      parentTouchedInBatch.has(parentBlock.id)
-    ) {
+    if (anyAncestorTouched(text, parentTouchedInBatch)) {
       return false;
     }
     const fallback = findEmptyTextPosition(state.doc, target, mapping, doc);
@@ -362,13 +399,13 @@ function applyTextDiff(
   let cursor = tr.mapping.map(prePos);
   for (const op of diff.diff as Delta<string>[]) {
     if (op.retain != null) {
-      // Pre-batch text was empty (otherwise the mapping wouldn't have
-      // been pruned), so `retain`/`delete` make no sense in the
-      // fallback path. Bail rather than risk corruption.
-      if (usedFallback) {
+      // A `retain: 0` is a legal no-op even on a freshly-emptied text;
+      // only a positive retain is incompatible with the empty-text
+      // fallback path (we'd be walking over characters that don't exist).
+      if (usedFallback && op.retain > 0) {
         return false;
       }
-      if (op.attributes) {
+      if (op.attributes && op.retain > 0) {
         if (
           !applyMarkAttributes(
             tr,
@@ -402,6 +439,39 @@ function applyTextDiff(
     }
   }
   return true;
+}
+
+/**
+ * Returns true if any ancestor of the given Loro container has been
+ * recorded in `parentTouchedInBatch` (the set of block IDs whose
+ * children list was mutated earlier in this batch). The empty-text
+ * fallback walks the parent block's pre-batch children to compute a
+ * PM position; an insert/delete in any ancestor breaks that
+ * invariant.
+ */
+function anyAncestorTouched(
+  container: { parent: () => unknown } | null | undefined,
+  parentTouchedInBatch: Set<ContainerID>,
+): boolean {
+  let node: unknown = container?.parent();
+  while (node != null) {
+    if (
+      node instanceof LoroMap &&
+      parentTouchedInBatch.has((node as LoroMap).id)
+    ) {
+      return true;
+    }
+    if (
+      node instanceof LoroMap ||
+      node instanceof LoroList ||
+      node instanceof LoroText
+    ) {
+      node = (node as { parent: () => unknown }).parent();
+    } else {
+      break;
+    }
+  }
+  return false;
 }
 
 /**
@@ -479,6 +549,7 @@ function applyListDiff(
   doc: LoroDocType,
   materialisedInBatch: Set<ContainerID>,
   parentTouchedInBatch: Set<ContainerID>,
+  locationCache: Map<ContainerID, ContainerLocation | null>,
 ): boolean {
   const loroList = doc.getContainerById(target);
   if (!(loroList instanceof LoroList)) {
@@ -492,7 +563,12 @@ function applyListDiff(
     return false;
   }
 
-  const parentLoc = findContainerLocation(state.doc, parentMap.id, mapping);
+  const parentLoc = findContainerLocation(
+    state.doc,
+    parentMap.id,
+    mapping,
+    locationCache,
+  );
   if (parentLoc == null || parentLoc.isText) {
     return false;
   }
@@ -780,6 +856,7 @@ function applyMapDiff(
   diff: MapDiff,
   mapping: LoroNodeMapping,
   doc: LoroDocType,
+  locationCache: Map<ContainerID, ContainerLocation | null>,
 ): boolean {
   const container = doc.getContainerById(target);
   if (!(container instanceof LoroMap)) {
@@ -800,7 +877,12 @@ function applyMapDiff(
     return false;
   }
 
-  const blockLoc = findContainerLocation(state.doc, parent.id, mapping);
+  const blockLoc = findContainerLocation(
+    state.doc,
+    parent.id,
+    mapping,
+    locationCache,
+  );
   if (blockLoc == null || blockLoc.isText || Array.isArray(blockLoc.node)) {
     return false;
   }
