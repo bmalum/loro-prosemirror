@@ -648,3 +648,324 @@ describe("loroEventBatchToTransaction (map)", () => {
     expect(newState.doc.child(0).attrs.emoji).toBe("");
   });
 });
+
+
+// ---------------------------------------------------------------------------
+// Phase 4: edge cases (nested + concurrent + missing mapping + roundtrip)
+// ---------------------------------------------------------------------------
+
+describe("loroEventBatchToTransaction (edge cases)", () => {
+  test("inserts a list item into a nested bulletList", async () => {
+    const fixture = {
+      type: "doc",
+      content: [
+        {
+          type: "bulletList",
+          content: [
+            {
+              type: "listItem",
+              content: [
+                {
+                  type: "paragraph",
+                  content: [{ type: "text", text: "Outer" }],
+                },
+                {
+                  type: "bulletList",
+                  content: [
+                    {
+                      type: "listItem",
+                      content: [
+                        {
+                          type: "paragraph",
+                          content: [{ type: "text", text: "Inner" }],
+                        },
+                      ],
+                    },
+                  ],
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    };
+    const { loroDoc, editorState, mapping } = buildSyncedFixture(fixture);
+    const { batches, dispose } = captureEvents(loroDoc);
+
+    const innerDoc = loroDoc.getMap(ROOT_DOC_KEY) as LoroNode;
+    const outerList = getLoroMapChildren(innerDoc).get(0) as LoroNode;
+    const outerItem = getLoroMapChildren(outerList).get(0) as LoroNode;
+    // Children of outer item: [paragraph, bulletList]
+    const innerList = getLoroMapChildren(outerItem).get(1) as LoroNode;
+    const innerItems = getLoroMapChildren(innerList);
+    const newItem = insertLoroMap(innerItems, "listItem");
+    const newPara = insertLoroMap(getLoroMapChildren(newItem), "paragraph");
+    const newText = insertLoroText(getLoroMapChildren(newPara));
+    newText.insert(0, "Sibling");
+    loroDoc.commit();
+    await oneMs();
+    dispose();
+
+    const tr = loroEventBatchToTransaction(
+      editorState,
+      batches[0],
+      mapping,
+      loroDoc,
+    );
+    expect(tr).not.toBeNull();
+    const newState = editorState.apply(tr!);
+    // Verify the doc has the new nested item.
+    const outerListPm = newState.doc.child(0);
+    expect(outerListPm.type.name).toBe("bulletList");
+    const outerItemPm = outerListPm.child(0);
+    expect(outerItemPm.type.name).toBe("listItem");
+    const innerListPm = outerItemPm.child(1);
+    expect(innerListPm.type.name).toBe("bulletList");
+    expect(innerListPm.childCount).toBe(2);
+    expect(innerListPm.child(1).child(0).textContent).toBe("Sibling");
+  });
+
+  test("handles a multi-event import: new block + edit to an existing block", async () => {
+    const docA: LoroDocType = new LoroDoc();
+    const docB: LoroDocType = new LoroDoc();
+
+    const seedState = createEditorState(schema, helloWorldDoc);
+    const seedMapping: LoroNodeMapping = new Map();
+    updateLoroToPmState(docA, seedMapping, seedState);
+    docB.import(docA.export({ mode: "snapshot" }));
+
+    const innerA = docA.getMap(ROOT_DOC_KEY);
+    const nodeA = createNodeFromLoroObj(
+      schema,
+      innerA as LoroMap<LoroNodeContainerType>,
+      new Map(),
+    );
+    const editorStateA = createEditorState(schema, nodeA.toJSON());
+    const mappingA = rebindMapping(editorStateA.doc, innerA as LoroNode);
+
+    // B does both: edits the first paragraph AND adds a new third paragraph.
+    const innerB = docB.getMap(ROOT_DOC_KEY);
+    const firstTextB = getLoroMapChildren(
+      getLoroMapChildren(innerB as LoroNode).get(0) as LoroNode,
+    ).get(0) as LoroText;
+    firstTextB.insert(11, " edited");
+    const newParaB = insertLoroMap(
+      getLoroMapChildren(innerB as LoroNode),
+      "paragraph",
+    );
+    const newTextB = insertLoroText(getLoroMapChildren(newParaB));
+    newTextB.insert(0, "Brand new");
+    docB.commit();
+
+    const batches: LoroEventBatch[] = [];
+    const unsub = docA.subscribe((batch) => {
+      if (batch.by === "import") batches.push(batch);
+    });
+    docA.import(docB.export({ mode: "update", from: docA.version() }));
+    await oneMs();
+    unsub();
+
+    expect(batches.length).toBeGreaterThan(0);
+    const tr = loroEventBatchToTransaction(
+      editorStateA,
+      batches[0],
+      mappingA,
+      docA,
+    );
+    expect(tr).not.toBeNull();
+    const newState = editorStateA.apply(tr!);
+    expect(newState.doc.childCount).toBe(3);
+    expect(newState.doc.child(0).textContent).toBe("Hello world edited");
+    expect(newState.doc.child(1).textContent).toBe("Second");
+    expect(newState.doc.child(2).textContent).toBe("Brand new");
+  });
+
+  test("returns null when an event references a container with no mapping", async () => {
+    // Build a fixture, then deliberately corrupt the mapping by removing the
+    // first paragraph's binding. A subsequent text edit on that paragraph
+    // can't be located and the translator must bail (caller falls back).
+    const { loroDoc, editorState, mapping } = buildSyncedFixture(helloWorldDoc);
+    const innerDoc = loroDoc.getMap(ROOT_DOC_KEY) as LoroNode;
+    const firstPara = getLoroMapChildren(innerDoc).get(0) as LoroNode;
+    const firstText = getLoroMapChildren(firstPara).get(0) as LoroText;
+
+    // Drop the text container's mapping entry — simulates a brand-new
+    // container that has not been materialised into PM yet.
+    mapping.delete(firstText.id);
+
+    const { batches, dispose } = captureEvents(loroDoc);
+    firstText.insert(0, "X");
+    loroDoc.commit();
+    await oneMs();
+    dispose();
+
+    const tr = loroEventBatchToTransaction(
+      editorState,
+      batches[0],
+      mapping,
+      loroDoc,
+    );
+    expect(tr).toBeNull();
+    // The legacy full-replace path is what the plugin uses when this
+    // happens; we only assert here that the translator signals the bail
+    // correctly and never throws.
+  });
+
+  test("converges A and B under a randomized sequence of edits (fuzz roundtrip)", async () => {
+    // Set up two synced peers. Apply 40 random edits to B, replicate to A
+    // via per-batch incremental sync, and assert that A's PM doc + Loro
+    // doc match B's at the end. This is the closest thing to a stress test
+    // we run in CI; the deterministic seed keeps it reproducible.
+    const docA: LoroDocType = new LoroDoc();
+    const docB: LoroDocType = new LoroDoc();
+
+    const seedState = createEditorState(schema, helloWorldDoc);
+    const seedMapping: LoroNodeMapping = new Map();
+    updateLoroToPmState(docA, seedMapping, seedState);
+    docB.import(docA.export({ mode: "snapshot" }));
+
+    const innerA = docA.getMap(ROOT_DOC_KEY);
+    const nodeA = createNodeFromLoroObj(
+      schema,
+      innerA as LoroMap<LoroNodeContainerType>,
+      new Map(),
+    );
+    let editorStateA = createEditorState(schema, nodeA.toJSON());
+    let mappingA = rebindMapping(editorStateA.doc, innerA as LoroNode);
+
+    // A simple deterministic LCG so failures are reproducible.
+    let rng = 0xc0ffee;
+    const rand = (n: number) => {
+      rng = (rng * 1664525 + 1013904223) >>> 0;
+      return rng % n;
+    };
+
+    let fellBackTextEdits = 0;
+    let incrementalApplied = 0;
+
+    for (let step = 0; step < 40; step++) {
+      const innerB = docB.getMap(ROOT_DOC_KEY);
+      const blocksB = getLoroMapChildren(innerB as LoroNode);
+      const blockCount = blocksB.length;
+      const action = rand(4);
+
+      if (action === 0 && blockCount > 0) {
+        // Insert text into a random existing paragraph.
+        const blockIdx = rand(blockCount);
+        const block = blocksB.get(blockIdx) as LoroNode;
+        if (block.get("nodeName") !== "paragraph") continue;
+        const blockText = getLoroMapChildren(block).get(0) as
+          | LoroText
+          | undefined;
+        if (!blockText) continue;
+        const at = rand(blockText.length + 1);
+        blockText.insert(at, String.fromCharCode(97 + rand(26)));
+      } else if (action === 1 && blockCount > 0) {
+        // Delete one char from a random existing paragraph (if it has any).
+        const blockIdx = rand(blockCount);
+        const block = blocksB.get(blockIdx) as LoroNode;
+        if (block.get("nodeName") !== "paragraph") continue;
+        const blockText = getLoroMapChildren(block).get(0) as
+          | LoroText
+          | undefined;
+        if (!blockText || blockText.length === 0) continue;
+        const at = rand(blockText.length);
+        blockText.delete(at, 1);
+      } else if (action === 2) {
+        // Append a new paragraph.
+        const newPara = insertLoroMap(blocksB, "paragraph");
+        const newText = insertLoroText(getLoroMapChildren(newPara));
+        newText.insert(0, "p" + step);
+      } else if (action === 3 && blockCount > 1) {
+        // Delete a random block (but never the last one).
+        const idx = rand(blockCount - 1);
+        // Refuse to delete the noteTitle if present (schema requirement).
+        const candidate = blocksB.get(idx) as LoroNode;
+        if (candidate.get("nodeName") === "noteTitle") continue;
+        blocksB.delete(idx, 1);
+      } else {
+        continue;
+      }
+      docB.commit();
+
+      // Stream B's progress to A.
+      const batches: LoroEventBatch[] = [];
+      const unsub = docA.subscribe((batch) => {
+        if (batch.by === "import") batches.push(batch);
+      });
+      docA.import(docB.export({ mode: "update", from: docA.version() }));
+      await oneMs();
+      unsub();
+
+      for (const batch of batches) {
+        const tr = loroEventBatchToTransaction(
+          editorStateA,
+          batch,
+          mappingA,
+          docA,
+        );
+        if (tr == null) {
+          // Translator bailed — apply the safety-net rebuild instead. The
+          // existing plugin uses createNodeFromLoroObj here too.
+          const innerANow = docA.getMap(ROOT_DOC_KEY);
+          const fresh = createNodeFromLoroObj(
+            schema,
+            innerANow as LoroMap<LoroNodeContainerType>,
+            new Map(),
+          );
+          editorStateA = createEditorState(schema, fresh.toJSON());
+          mappingA = rebindMapping(editorStateA.doc, innerANow as LoroNode);
+          fellBackTextEdits++;
+        } else {
+          editorStateA = editorStateA.apply(tr);
+          mappingA = rebindMapping(editorStateA.doc, docA.getMap(
+            ROOT_DOC_KEY,
+          ) as LoroNode);
+          incrementalApplied++;
+        }
+      }
+    }
+
+    // After all the edits, A's PM doc and B's Loro doc must agree.
+    const innerB = docB.getMap(ROOT_DOC_KEY);
+    const expectedNode = createNodeFromLoroObj(
+      schema,
+      innerB as LoroMap<LoroNodeContainerType>,
+      new Map(),
+    );
+    expect(editorStateA.doc.toJSON()).toEqual(expectedNode.toJSON());
+
+    // Sanity: at least *some* of the random edits exercised the
+    // incremental path (otherwise the test isn't testing anything).
+    // We don't assert zero fallbacks because the safety net is part of the
+    // contract; we just want to know the test exercised the hot path.
+    expect(fellBackTextEdits).toBeLessThanOrEqual(40);
+    expect(incrementalApplied).toBeGreaterThan(0);
+  });
+
+  test("text inserts never fall back to the safety net", async () => {
+    // The hot path. If this regresses, we lose the entire point of the
+    // incremental binding — every keystroke would rebuild the doc.
+    const { loroDoc, editorState, mapping } = buildSyncedFixture(helloWorldDoc);
+    const { batches, dispose } = captureEvents(loroDoc);
+
+    const innerDoc = loroDoc.getMap(ROOT_DOC_KEY) as LoroNode;
+    const firstText = getLoroMapChildren(
+      getLoroMapChildren(innerDoc).get(0) as LoroNode,
+    ).get(0) as LoroText;
+    firstText.insert(11, "!");
+    loroDoc.commit();
+    await oneMs();
+    dispose();
+
+    for (const batch of batches) {
+      const tr = loroEventBatchToTransaction(
+        editorState,
+        batch,
+        mapping,
+        loroDoc,
+      );
+      expect(tr).not.toBeNull();
+    }
+  });
+});
