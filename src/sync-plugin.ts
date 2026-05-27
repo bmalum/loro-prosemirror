@@ -7,6 +7,7 @@ import {
   convertPmSelectionToCursors,
   cursorToAbsolutePosition,
 } from "./cursor/common";
+import { loroEventBatchToTransaction } from "./incremental-sync";
 import {
   clearChangedNodes,
   createNodeFromLoroObj,
@@ -183,6 +184,55 @@ function updateNodeOnLoroEvent(view: EditorView, event: LoroEventBatch) {
     return;
   }
 
+  // First try to translate the event batch into surgical PM Steps. When the
+  // translation succeeds we dispatch a single transaction and rely on PM's
+  // built-in selection mapping to keep the cursor in place — no manual
+  // `setTimeout(syncCursorsToPmSelection)` dance is needed.
+  //
+  // When the translator returns null (or throws) we fall back to the legacy
+  // full-document rebuild so the doc never diverges. This is the safety net.
+  const incrementalTr = tryIncrementalSync(view, event, state);
+  if (incrementalTr != null) {
+    incrementalTr.setMeta(loroSyncPluginKey, { type: "non-local-updates" });
+    view.dispatch(incrementalTr);
+    return;
+  }
+
+  fullReplaceFallback(view, event, state);
+}
+
+/**
+ * Attempt to build an incremental ProseMirror transaction from a Loro event
+ * batch. Errors are caught and reported once; the caller treats `null` as
+ * "use the full-replace fallback".
+ */
+function tryIncrementalSync(
+  view: EditorView,
+  event: LoroEventBatch,
+  state: LoroSyncPluginState,
+) {
+  try {
+    return loroEventBatchToTransaction(view.state, event, state.mapping);
+  } catch (e) {
+    console.error(
+      "[loro-prosemirror] incremental sync failed, falling back to full replace:",
+      e,
+    );
+    return null;
+  }
+}
+
+/**
+ * Legacy full-document rebuild. Kept as the safety net for events that the
+ * incremental translator cannot (yet) handle — it is the historical behaviour
+ * of this plugin and is guaranteed to leave the PM doc in a state that
+ * matches Loro's view of the world.
+ */
+function fullReplaceFallback(
+  view: EditorView,
+  event: LoroEventBatch,
+  state: LoroSyncPluginState,
+) {
   const mapping = state.mapping;
   clearChangedNodes(state.doc as LoroDocType, event, mapping);
   const node = createNodeFromLoroObj(
@@ -200,7 +250,7 @@ function updateNodeOnLoroEvent(view: EditorView, event: LoroEventBatch) {
     state,
   );
 
-  let tr = view.state.tr.replace(
+  const tr = view.state.tr.replace(
     0,
     view.state.doc.content.size,
     new Slice(Fragment.from(node), 0, 0),
