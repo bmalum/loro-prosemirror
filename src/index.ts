@@ -1,9 +1,14 @@
 export { LoroSyncPlugin } from "./sync-plugin";
 export {
   loroSyncPluginKey,
+  LORO_SYNC_META,
+  getLoroSyncMeta,
+  isLoroInternalTransaction,
   type LoroSyncEvent,
+  type LoroSyncMetaType,
   type LoroSyncPluginProps,
   type LoroSyncPluginState,
+  type LoroSyncTransactionMeta,
 } from "./sync-plugin-key";
 export {
   createNodeFromLoroObj,

@@ -63,6 +63,7 @@ export const LoroSyncPlugin = (props: LoroSyncPluginProps): Plugin => {
           changedBy: "local",
           containerId: props.containerId,
           onSyncEvent: props.onSyncEvent,
+          disableFallbackCursorRestore: props.disableFallbackCursorRestore,
         };
       },
       apply: (
@@ -244,12 +245,18 @@ function init(view: EditorView, props: LoroSyncPluginProps): () => void {
 
 /**
  * Decide which initial-sync direction to take and dispatch the bootstrap
- * transaction. Three cases:
- *   1. Loro empty + PM empty: just bind the empty mapping.
- *   2. Loro empty + PM has content: write PM into Loro (initial seed).
- *      Avoids the silent-content-clobber bug where a host loaded saved
- *      content into PM and attached the sync plugin to a fresh Loro doc.
- *   3. Loro has content: replace PM with Loro's tree (Loro is canonical).
+ * transaction. Three cases (also surfaced via `onSyncEvent` as
+ * `{ kind: "init", mode: ... }` so consumers know what happened):
+ *   1. `both-empty`: Loro empty + PM empty — just bind the empty mapping.
+ *      No Loro commits emitted.
+ *   2. `pm-seeded`: Loro empty + PM has content — write PM into Loro
+ *      (initial seed). Avoids the silent-content-clobber bug where a
+ *      host loaded saved content into PM and attached the sync plugin
+ *      to a fresh Loro doc. **Local Loro commits ARE emitted in this
+ *      mode** — host wire-push layers should expect them.
+ *   3. `loro-populated`: Loro has content — replace PM with Loro's
+ *      tree. Commits Loro with `sys:init` origin (no-op when nothing
+ *      was buffered, which is the common case).
  */
 function bootstrapDispatch(
   view: EditorView,
@@ -275,6 +282,7 @@ function bootstrapDispatch(
     });
     tr.setMeta("addToHistory", false);
     view.dispatch(tr);
+    emitSyncEvent(state, { kind: "init", mode: "both-empty" });
     return;
   }
 
@@ -296,6 +304,7 @@ function bootstrapDispatch(
     });
     tr.setMeta("addToHistory", false);
     view.dispatch(tr);
+    emitSyncEvent(state, { kind: "init", mode: "pm-seeded" });
     return;
   }
 
@@ -325,6 +334,7 @@ function bootstrapDispatch(
   });
   tr.setMeta("addToHistory", false);
   view.dispatch(tr);
+  emitSyncEvent(state, { kind: "init", mode: "loro-populated" });
 }
 
 /**
@@ -510,6 +520,15 @@ function fullReplaceFallback(
   view.dispatch(tr);
 
   if (anchor == null) {
+    return;
+  }
+  if (state.disableFallbackCursorRestore) {
+    // Host has its own cursor-restore mechanism (typically an
+    // `appendTransaction` that detects `LORO_SYNC_META.NON_LOCAL_UPDATES`
+    // and re-sets the selection synchronously during the same tx
+    // batch). Running our microtask afterwards would override the
+    // host's chosen position with our Loro-cursor round-trip, which
+    // can be slightly less accurate.
     return;
   }
   // Defer with queueMicrotask (instead of setTimeout) so the selection
