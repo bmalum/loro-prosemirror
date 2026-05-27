@@ -563,6 +563,15 @@ function applyListDiff(
     return false;
   }
 
+  // If this parent already had a list event in the same batch,
+  // bail to fallback. snapshotChildren operates on pre-state PM children
+  // and the second pass would compute offsets against that pre-state
+  // even though tr already contains the first event's inserts/deletes
+  // — producing inconsistent absolute positions.
+  if (parentTouchedInBatch.has(parentMap.id)) {
+    return false;
+  }
+
   const parentLoc = findContainerLocation(
     state.doc,
     parentMap.id,
@@ -610,7 +619,7 @@ function applyListDiff(
           contentStart + pmCursor + removedSize,
         );
         for (const subtree of subtreesToPrune) {
-          pruneSubtreeFromMapping(subtree, mapping);
+          pruneSubtreeFromMapping(subtree, mapping, locationCache);
         }
         listChanged = true;
       }
@@ -716,7 +725,9 @@ function snapshotChildren(parent: Node): ListItemSnapshot[] {
 
 /**
  * Recursively remove `mapping` entries for every Loro container bound to
- * a deleted PM subtree.
+ * a deleted PM subtree. Also invalidates `locationCache` entries for
+ * the pruned IDs so a later event in the same batch cannot read a
+ * stale location for a deleted container.
  *
  * For block PM Nodes we look up the ContainerID in the
  * `WEAK_NODE_TO_LORO_CONTAINER_MAPPING` reverse index and prune by id
@@ -727,6 +738,7 @@ function snapshotChildren(parent: Node): ListItemSnapshot[] {
 function pruneSubtreeFromMapping(
   pmNode: Node | Node[],
   mapping: LoroNodeMapping,
+  locationCache?: Map<ContainerID, ContainerLocation | null>,
 ): void {
   if (Array.isArray(pmNode)) {
     if (pmNode.length === 0) {
@@ -735,6 +747,7 @@ function pruneSubtreeFromMapping(
     const cid = findContainerIdForTextRun(mapping, pmNode);
     if (cid != null) {
       mapping.delete(cid);
+      locationCache?.delete(cid);
     }
     return;
   }
@@ -749,6 +762,7 @@ function pruneSubtreeFromMapping(
     findBlockContainerId(mapping, pmNode);
   if (cid != null) {
     mapping.delete(cid);
+    locationCache?.delete(cid);
   }
   let i = 0;
   while (i < pmNode.childCount) {
@@ -759,9 +773,9 @@ function pruneSubtreeFromMapping(
         run.push(pmNode.child(i));
         i++;
       }
-      pruneSubtreeFromMapping(run, mapping);
+      pruneSubtreeFromMapping(run, mapping, locationCache);
     } else {
-      pruneSubtreeFromMapping(child, mapping);
+      pruneSubtreeFromMapping(child, mapping, locationCache);
       i++;
     }
   }
