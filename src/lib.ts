@@ -81,17 +81,26 @@ export function updateLoroToPmState(
 
   let isInit = false;
   if (map.get("nodeName") == null) {
-    doc.commit();
     isInit = true;
     map.set("nodeName", node.type.name);
   }
 
-  updateLoroMap(map, node, mapping);
-  if (isInit) {
-    doc.commit({ origin: "sys:init" });
-  } else {
-    doc.commit({ origin: "loroSyncPlugin" });
+  // Run the diff/apply step. If updateLoroMap throws (e.g. node-name
+  // mismatch from a divergent merge), still commit any pending changes
+  // we already made so Loro doesn't sit on uncommitted state, then
+  // re-throw so the caller (sync-plugin's `apply`) can surface the
+  // error via `onSyncEvent`.
+  try {
+    updateLoroMap(map, node, mapping);
+  } catch (e) {
+    try {
+      doc.commit({ origin: isInit ? "sys:init" : "loroSyncPlugin" });
+    } catch {
+      // ignore — the throw below carries the original error
+    }
+    throw e;
   }
+  doc.commit({ origin: isInit ? "sys:init" : "loroSyncPlugin" });
 }
 
 export function createNodeFromLoroObj(
@@ -710,13 +719,18 @@ export function clearChangedNodes(
 /**
  * Set a text selection between the given anchor and head positions. This
  * function will ignore out-of-bounds positions, and find a valid selection near
- * the given positions.
+ * the given positions. Re-resolves against `view.state.doc` at dispatch
+ * time so an asynchronously-scheduled call (e.g. via `queueMicrotask`)
+ * never operates on a stale doc.
  */
 export function safeSetSelection(
   view: EditorView,
   anchor: number,
   head?: number,
 ): void {
+  if (view.isDestroyed) {
+    return;
+  }
   const doc = view.state.doc;
   const docSize = doc.content.size;
   if (

@@ -38,6 +38,20 @@ export type LoroSyncEvent =
       eventCount: number;
       by: "local" | "import" | "checkout";
       origin?: string;
+    }
+  | {
+      kind: "error";
+      /**
+       * Where the error originated:
+       *   - `doc-changed` — `updateLoroToPmState` threw while writing PM->Loro
+       *     (typically a node-name mismatch from a divergent merge).
+       *   - `update-state` — Loro `commit()` threw inside the plugin's
+       *     `update-state` apply branch.
+       *   - `cursor-encode` — encoding the local PM selection as a Loro
+       *     cursor failed (mapping miss, range out of bounds, etc.).
+       */
+      phase: "doc-changed" | "update-state" | "cursor-encode";
+      error: unknown;
     };
 
 export interface LoroSyncPluginProps {

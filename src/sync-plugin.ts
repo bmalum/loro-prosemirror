@@ -1,6 +1,6 @@
 import type { Cursor, LoroEventBatch, LoroMap } from "loro-crdt";
 import { Fragment, Slice } from "prosemirror-model";
-import { type EditorState, Plugin, type StateField } from "prosemirror-state";
+import { Plugin, type StateField } from "prosemirror-state";
 import type { EditorView } from "prosemirror-view";
 
 import {
@@ -28,15 +28,20 @@ import { configLoroTextStyle } from "./text-style";
 import { loroUndoPluginKey } from "./undo-plugin-key";
 
 type PluginTransactionType =
-  | {
-      type: "doc-changed";
-    }
+  | { type: "doc-changed" }
   | {
       type: "non-local-updates";
+      /** Loro's classification of the source of the upstream change. */
+      changedBy: "import" | "checkout" | "local";
     }
   | {
       type: "update-state";
       state: Partial<LoroSyncPluginState>;
+      /**
+       * Whether to commit Loro with `sys:init` origin after merging the
+       * partial state. Only the initial bootstrap from `init()` sets this.
+       */
+      commitInit?: boolean;
     };
 
 export const LoroSyncPlugin = (props: LoroSyncPluginProps): Plugin => {
@@ -60,42 +65,90 @@ export const LoroSyncPlugin = (props: LoroSyncPluginProps): Plugin => {
           onSyncEvent: props.onSyncEvent,
         };
       },
-      apply: (tr, state, oldEditorState, newEditorState) => {
+      apply: (
+        tr,
+        state,
+        oldEditorState,
+        newEditorState,
+      ): LoroSyncPluginState => {
         const meta = tr.getMeta(
           loroSyncPluginKey,
         ) as PluginTransactionType | null;
         const undoState = loroUndoPluginKey.getState(oldEditorState);
 
-        if (meta?.type === "non-local-updates") {
-          state.changedBy = "import";
-        } else {
-          state.changedBy = "local";
-        }
         switch (meta?.type) {
-          case "doc-changed":
+          case "non-local-updates":
+            // Upstream Loro change — record where it came from. Critically
+            // we do NOT call `updateLoroToPmState` here: the diff was just
+            // applied PM-side from a Loro event, echoing it back would loop.
+            return state.changedBy === meta.changedBy
+              ? state
+              : { ...state, changedBy: meta.changedBy };
+
+          case "doc-changed": {
+            // PM-side edit happened — push it to Loro. Skip while an undo
+            // is in flight so the undo's PM transaction doesn't echo back.
             if (!undoState?.isUndoing.current) {
-              updateLoroToPmState(
-                state.doc as LoroDocType,
-                state.mapping,
-                newEditorState,
-                props.containerId,
-              );
+              try {
+                updateLoroToPmState(
+                  state.doc as LoroDocType,
+                  state.mapping,
+                  newEditorState,
+                  props.containerId,
+                );
+              } catch (e) {
+                emitSyncEvent(state, {
+                  kind: "error",
+                  phase: "doc-changed",
+                  error: e,
+                });
+                console.error(
+                  "[loro-prosemirror] updateLoroToPmState threw, doc may diverge until next event:",
+                  e,
+                );
+              }
             }
-            break;
-          case "update-state":
-            state = { ...state, ...meta.state };
-            state.doc.commit({
-              origin: "sys:init",
-              timestamp: Date.now(),
-            });
-            break;
+            return state.changedBy === "local"
+              ? state
+              : { ...state, changedBy: "local" };
+          }
+
+          case "update-state": {
+            const next: LoroSyncPluginState = { ...state, ...meta.state };
+            if (meta.commitInit) {
+              try {
+                next.doc.commit({
+                  origin: "sys:init",
+                  timestamp: Date.now(),
+                });
+              } catch (e) {
+                emitSyncEvent(next, {
+                  kind: "error",
+                  phase: "update-state",
+                  error: e,
+                });
+                console.error("[loro-prosemirror] sys:init commit threw:", e);
+              }
+            }
+            return next;
+          }
+
           default:
-            break;
+            return state;
         }
-        return state;
       },
     } as StateField<LoroSyncPluginState>,
     appendTransaction: (transactions, _oldEditorState, newEditorState) => {
+      // Only echo PM->Loro for transactions that are user/host edits, not
+      // the plugin's own non-local-updates / update-state transactions.
+      // Otherwise an upstream Loro event triggers a PM dispatch that we'd
+      // immediately re-export to Loro (echo loop).
+      const isInternal = transactions.some(
+        (tr) => tr.getMeta(loroSyncPluginKey) != null,
+      );
+      if (isInternal) {
+        return null;
+      }
       if (transactions.some((tr) => tr.docChanged)) {
         return newEditorState.tr.setMeta(loroSyncPluginKey, {
           type: "doc-changed",
@@ -104,18 +157,23 @@ export const LoroSyncPlugin = (props: LoroSyncPluginProps): Plugin => {
       return null;
     },
     view: (view: EditorView) => {
-      const timeoutId = setTimeout(() => init(view), 0);
+      // Run init synchronously. The previous `setTimeout(() => init(view), 0)`
+      // opened a window during which user input or programmatic dispatches
+      // would be silently clobbered by the initial replace(0, content.size).
+      init(view);
       return {
-        update: (_view: EditorView, _prevState: EditorState) => {},
+        update: (_view: EditorView, _prevState) => {},
         destroy: () => {
-          clearTimeout(timeoutId);
+          const state = loroSyncPluginKey.getState(view.state);
+          state?.docSubscription?.();
         },
       };
     },
   });
 };
 
-// This is called when the plugin's state is associated with an editor view
+// This is called when the plugin's state is associated with an editor view.
+// Runs synchronously inside the plugin's `view()` setup.
 function init(view: EditorView) {
   if (view.isDestroyed) {
     return;
@@ -123,10 +181,11 @@ function init(view: EditorView) {
 
   const state = loroSyncPluginKey.getState(view.state) as LoroSyncPluginState;
 
-  let docSubscription = state.docSubscription;
+  // If init was already run for this view (e.g. because the plugin got
+  // re-mounted), don't re-bootstrap — just refresh the subscription.
+  state.docSubscription?.();
 
-  docSubscription?.();
-
+  let docSubscription: ReturnType<typeof state.doc.subscribe>;
   if (state.containerId) {
     docSubscription = state
       .doc!.getContainerById(state.containerId)!
@@ -147,16 +206,19 @@ function init(view: EditorView) {
 
   const mapping: LoroNodeMapping = new Map();
   if (innerDoc.size === 0) {
-    // Empty doc
+    // Empty Loro doc — clear PM and bind the (now-empty) mapping. Marked
+    // commitInit so the plugin tags the next batch with sys:init origin.
     const tr = view.state.tr.delete(0, view.state.doc.content.size);
     tr.setMeta(loroSyncPluginKey, {
       type: "update-state",
       state: { mapping, docSubscription, snapshot: null },
+      commitInit: true,
     });
+    tr.setMeta("addToHistory", false);
     view.dispatch(tr);
   } else {
+    // Loro has content — replace PM with the materialised tree.
     const schema = view.state.schema;
-    // Create node from loro object
     const node = createNodeFromLoroObj(
       schema,
       innerDoc as LoroMap<LoroNodeContainerType>,
@@ -170,7 +232,9 @@ function init(view: EditorView) {
     tr.setMeta(loroSyncPluginKey, {
       type: "update-state",
       state: { mapping, docSubscription, snapshot: null },
+      commitInit: true,
     });
+    tr.setMeta("addToHistory", false);
     view.dispatch(tr);
   }
 }
@@ -181,8 +245,10 @@ function updateNodeOnLoroEvent(view: EditorView, event: LoroEventBatch) {
   }
 
   const state = loroSyncPluginKey.getState(view.state) as LoroSyncPluginState;
-  state.changedBy = event.by;
   if (event.by === "local" && event.origin !== "undo") {
+    // Our own write that doesn't come from an undo replay. The PM dispatch
+    // that produced this Loro change has already updated the editor; we
+    // don't need to round-trip it back into PM.
     return;
   }
 
@@ -195,7 +261,11 @@ function updateNodeOnLoroEvent(view: EditorView, event: LoroEventBatch) {
   // full-document rebuild so the doc never diverges. This is the safety net.
   const { tr: incrementalTr, threw } = tryIncrementalSync(view, event, state);
   if (incrementalTr != null) {
-    incrementalTr.setMeta(loroSyncPluginKey, { type: "non-local-updates" });
+    incrementalTr.setMeta(loroSyncPluginKey, {
+      type: "non-local-updates",
+      changedBy: event.by,
+    });
+    incrementalTr.setMeta("addToHistory", false);
     view.dispatch(incrementalTr);
     emitSyncEvent(state, {
       kind: "incremental",
@@ -301,9 +371,21 @@ function fullReplaceFallback(
   // selection mapping to handle the position. Consumers using checkout
   // typically manage their own cursor placement.
   const captureCursor = event.by !== "checkout";
-  const { anchor, focus } = captureCursor
-    ? convertPmSelectionToCursors(view.state.doc, view.state.selection, state)
-    : { anchor: undefined, focus: undefined };
+  let anchor: Cursor | undefined;
+  let focus: Cursor | undefined;
+  if (captureCursor) {
+    try {
+      const encoded = convertPmSelectionToCursors(
+        view.state.doc,
+        view.state.selection,
+        state,
+      );
+      anchor = encoded.anchor;
+      focus = encoded.focus;
+    } catch (e) {
+      emitSyncEvent(state, { kind: "error", phase: "cursor-encode", error: e });
+    }
+  }
 
   const tr = view.state.tr.replace(
     0,
@@ -313,14 +395,19 @@ function fullReplaceFallback(
 
   tr.setMeta(loroSyncPluginKey, {
     type: "non-local-updates",
+    changedBy: event.by,
   });
+  tr.setMeta("addToHistory", false);
   view.dispatch(tr);
 
   if (anchor == null) {
     return;
   }
-  setTimeout(() => {
-    syncCursorsToPmSelection(view, anchor, focus);
+  // Defer with queueMicrotask (instead of setTimeout) so the selection
+  // restore runs at the next microtask checkpoint — same task, so any
+  // synchronous follow-up still observes the correct cursor.
+  queueMicrotask(() => {
+    syncCursorsToPmSelection(view, anchor!, focus);
   });
 }
 
@@ -343,12 +430,14 @@ export function syncCursorsToPmSelection(
 
   const { doc, mapping } = state;
   const anchorPos = cursorToAbsolutePosition(anchor, doc, mapping)[0];
-  const focusPos = focus && cursorToAbsolutePosition(focus, doc, mapping)[0];
+  const focusPos = focus
+    ? cursorToAbsolutePosition(focus, doc, mapping)[0]
+    : undefined;
   if (anchorPos == null) {
     return;
   }
 
   // If the cursors are synced faster than the document, then the cursors might
   // be out of bounds. Thus, we need to check if the cursors are out of bounds.
-  safeSetSelection(view, anchorPos, focusPos);
+  safeSetSelection(view, anchorPos, focusPos ?? undefined);
 }
