@@ -43,14 +43,27 @@ export type LoroSyncEvent =
       kind: "error";
       /**
        * Where the error originated:
+       *   - `init` — the plugin's initial bootstrap (Loro→PM replace, or
+       *     PM→Loro initial seed) threw. The editor still mounts but
+       *     stays unsynced until the next event.
        *   - `doc-changed` — `updateLoroToPmState` threw while writing PM->Loro
        *     (typically a node-name mismatch from a divergent merge).
        *   - `update-state` — Loro `commit()` threw inside the plugin's
        *     `update-state` apply branch.
        *   - `cursor-encode` — encoding the local PM selection as a Loro
        *     cursor failed (mapping miss, range out of bounds, etc.).
+       *   - `cursor-decode` — decoding a remote Loro cursor to a PM
+       *     position failed (unmapped container, broken reference, etc.).
+       *   - `materialize` — `createNodeFromLoroObj` rejected a Loro tree
+       *     (schema validation, invalid nodeName, etc.).
        */
-      phase: "doc-changed" | "update-state" | "cursor-encode";
+      phase:
+        | "init"
+        | "doc-changed"
+        | "update-state"
+        | "cursor-encode"
+        | "cursor-decode"
+        | "materialize";
       error: unknown;
     };
 

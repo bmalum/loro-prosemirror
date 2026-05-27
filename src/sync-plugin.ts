@@ -1,4 +1,4 @@
-import type { Cursor, LoroEventBatch, LoroMap } from "loro-crdt";
+import type { Cursor, LoroEventBatch, LoroMap, Subscription } from "loro-crdt";
 import { Fragment, Slice } from "prosemirror-model";
 import { Plugin, type StateField } from "prosemirror-state";
 import type { EditorView } from "prosemirror-view";
@@ -94,7 +94,7 @@ export const LoroSyncPlugin = (props: LoroSyncPluginProps): Plugin => {
                   state.doc as LoroDocType,
                   state.mapping,
                   newEditorState,
-                  props.containerId,
+                  state.containerId,
                 );
               } catch (e) {
                 emitSyncEvent(state, {
@@ -157,47 +157,105 @@ export const LoroSyncPlugin = (props: LoroSyncPluginProps): Plugin => {
       return null;
     },
     view: (view: EditorView) => {
-      // Run init synchronously. The previous `setTimeout(() => init(view), 0)`
-      // opened a window during which user input or programmatic dispatches
-      // would be silently clobbered by the initial replace(0, content.size).
-      init(view);
+      // Capture the unsubscribe in a closure so `destroy()` can clean up
+      // even when init's dispatch throws and the plugin state never lands
+      // the docSubscription field. Without this the subscription would
+      // leak forever on a botched mount.
+      let unsubscribe: (() => void) | null = null;
+      try {
+        unsubscribe = init(view, props);
+      } catch (e) {
+        // Wrap the whole bootstrap. A throw out of view() during PM's
+        // updatePluginViews loop would interrupt plugin installation
+        // and leave the editor half-mounted. We absorb the error,
+        // emit it via onSyncEvent, and let the editor mount as a
+        // read-mostly view (the next remote event will still try to
+        // sync).
+        const state = loroSyncPluginKey.getState(view.state);
+        if (state != null) {
+          emitSyncEvent(state, { kind: "error", phase: "init", error: e });
+        }
+        console.error(
+          "[loro-prosemirror] init threw, editor mounted unsynced:",
+          e,
+        );
+      }
       return {
         update: (_view: EditorView, _prevState) => {},
         destroy: () => {
-          const state = loroSyncPluginKey.getState(view.state);
-          state?.docSubscription?.();
+          unsubscribe?.();
+          unsubscribe = null;
         },
       };
     },
   });
 };
 
-// This is called when the plugin's state is associated with an editor view.
-// Runs synchronously inside the plugin's `view()` setup.
-function init(view: EditorView) {
+/**
+ * Run the bootstrap dispatch that wires PM to Loro. Synchronous so a
+ * user keystroke landed before the plugin mounted cannot be silently
+ * clobbered (the `setTimeout` version had this race).
+ *
+ * Returns the unsubscribe function for the Loro subscription so the
+ * caller can hold it in a closure independent of plugin state. If the
+ * bootstrap dispatch throws, the unsubscribe is called before the
+ * throw propagates.
+ */
+function init(view: EditorView, props: LoroSyncPluginProps): () => void {
   if (view.isDestroyed) {
-    return;
+    return () => {};
   }
 
   const state = loroSyncPluginKey.getState(view.state) as LoroSyncPluginState;
 
-  // If init was already run for this view (e.g. because the plugin got
-  // re-mounted), don't re-bootstrap — just refresh the subscription.
-  state.docSubscription?.();
-
-  let docSubscription: ReturnType<typeof state.doc.subscribe>;
+  // Subscribe FIRST so we don't miss events emitted by our own bootstrap
+  // commit. The subscription handler (updateNodeOnLoroEvent) filters
+  // local non-undo events, so the sys:init batch is not re-applied.
+  let docSubscription: Subscription;
   if (state.containerId) {
-    docSubscription = state
-      .doc!.getContainerById(state.containerId)!
-      .subscribe((event) => {
-        updateNodeOnLoroEvent(view, event);
-      });
+    const container = state.doc.getContainerById(state.containerId);
+    if (container == null) {
+      throw new Error(
+        `[loro-prosemirror] containerId ${String(
+          state.containerId,
+        )} not found in Loro doc`,
+      );
+    }
+    docSubscription = container.subscribe((event) => {
+      updateNodeOnLoroEvent(view, event);
+    });
   } else {
     docSubscription = state.doc.subscribe((event) =>
       updateNodeOnLoroEvent(view, event),
     );
   }
 
+  // Wrap the dispatch in try/catch so a schema mismatch or invalid
+  // content cannot leak the subscription.
+  try {
+    bootstrapDispatch(view, state, docSubscription);
+  } catch (e) {
+    docSubscription();
+    throw e;
+  }
+
+  return docSubscription;
+}
+
+/**
+ * Decide which initial-sync direction to take and dispatch the bootstrap
+ * transaction. Three cases:
+ *   1. Loro empty + PM empty: just bind the empty mapping.
+ *   2. Loro empty + PM has content: write PM into Loro (initial seed).
+ *      Avoids the silent-content-clobber bug where a host loaded saved
+ *      content into PM and attached the sync plugin to a fresh Loro doc.
+ *   3. Loro has content: replace PM with Loro's tree (Loro is canonical).
+ */
+function bootstrapDispatch(
+  view: EditorView,
+  state: LoroSyncPluginState,
+  docSubscription: Subscription,
+): void {
   const innerDoc = state.containerId
     ? (state.doc.getContainerById(
         state.containerId,
@@ -205,38 +263,79 @@ function init(view: EditorView) {
     : (state.doc as LoroDocType).getMap(ROOT_DOC_KEY);
 
   const mapping: LoroNodeMapping = new Map();
-  if (innerDoc.size === 0) {
-    // Empty Loro doc — clear PM and bind the (now-empty) mapping. Marked
-    // commitInit so the plugin tags the next batch with sys:init origin.
-    const tr = view.state.tr.delete(0, view.state.doc.content.size);
+  const pmIsEmpty = isPmDocEmpty(view.state.doc);
+
+  if (innerDoc.size === 0 && pmIsEmpty) {
+    // Case 1: both empty. Nothing to copy; just register state.
+    const tr = view.state.tr;
     tr.setMeta(loroSyncPluginKey, {
       type: "update-state",
       state: { mapping, docSubscription, snapshot: null },
-      commitInit: true,
+      commitInit: false,
     });
     tr.setMeta("addToHistory", false);
     view.dispatch(tr);
-  } else {
-    // Loro has content — replace PM with the materialised tree.
-    const schema = view.state.schema;
-    const node = createNodeFromLoroObj(
-      schema,
-      innerDoc as LoroMap<LoroNodeContainerType>,
-      mapping,
-    );
-    const tr = view.state.tr.replace(
-      0,
-      view.state.doc.content.size,
-      new Slice(Fragment.from(node), 0, 0),
-    );
-    tr.setMeta(loroSyncPluginKey, {
-      type: "update-state",
-      state: { mapping, docSubscription, snapshot: null },
-      commitInit: true,
-    });
-    tr.setMeta("addToHistory", false);
-    view.dispatch(tr);
+    return;
   }
+
+  if (innerDoc.size === 0 && !pmIsEmpty) {
+    // Case 2: PM has content, Loro is empty — seed Loro from PM. Run
+    // updateLoroToPmState directly (it handles the empty-Loro case as
+    // an initial population) and bind the resulting mapping.
+    updateLoroToPmState(
+      state.doc as LoroDocType,
+      mapping,
+      view.state,
+      state.containerId,
+    );
+    const tr = view.state.tr;
+    tr.setMeta(loroSyncPluginKey, {
+      type: "update-state",
+      state: { mapping, docSubscription, snapshot: null },
+      commitInit: false,
+    });
+    tr.setMeta("addToHistory", false);
+    view.dispatch(tr);
+    return;
+  }
+
+  // Case 3: Loro has content — materialise it into PM and replace.
+  const schema = view.state.schema;
+  const node = createNodeFromLoroObj(
+    schema,
+    innerDoc as LoroMap<LoroNodeContainerType>,
+    mapping,
+    (e) =>
+      emitSyncEvent(state, { kind: "error", phase: "materialize", error: e }),
+  );
+  if (node == null) {
+    throw new Error(
+      "[loro-prosemirror] createNodeFromLoroObj returned null for the root container",
+    );
+  }
+  const tr = view.state.tr.replace(
+    0,
+    view.state.doc.content.size,
+    new Slice(Fragment.from(node), 0, 0),
+  );
+  tr.setMeta(loroSyncPluginKey, {
+    type: "update-state",
+    state: { mapping, docSubscription, snapshot: null },
+    commitInit: true,
+  });
+  tr.setMeta("addToHistory", false);
+  view.dispatch(tr);
+}
+
+/**
+ * Heuristic for "the host did not put any user content in PM yet". A
+ * fresh `EditorState.create({schema, plugins})` produces a doc whose
+ * `content.size` is zero (the doc node itself contributes opening/
+ * closing tokens but those are outside `content.size`). We rely on
+ * that to decide whether case 1 or case 2 applies.
+ */
+function isPmDocEmpty(doc: import("prosemirror-model").Node): boolean {
+  return doc.content.size === 0;
 }
 
 function updateNodeOnLoroEvent(view: EditorView, event: LoroEventBatch) {
@@ -362,7 +461,17 @@ function fullReplaceFallback(
         ) as LoroMap<LoroNodeContainerType>)
       : (state.doc as LoroDocType).getMap(ROOT_DOC_KEY),
     mapping,
+    (e) =>
+      emitSyncEvent(state, { kind: "error", phase: "materialize", error: e }),
   );
+  if (node == null) {
+    emitSyncEvent(state, {
+      kind: "error",
+      phase: "materialize",
+      error: new Error("createNodeFromLoroObj returned null on rebuild"),
+    });
+    return;
+  }
 
   // Only capture the local cursor when there's a meaningful chance we
   // can re-anchor it after the rebuild. For `checkout` batches the user
