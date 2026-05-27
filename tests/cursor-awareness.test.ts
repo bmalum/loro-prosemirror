@@ -7,7 +7,11 @@ import { EditorState } from "prosemirror-state";
 import { EditorView } from "prosemirror-view";
 
 import { LoroSyncPlugin } from "../src/sync-plugin";
-import { CursorAwareness, LoroCursorPlugin, cursorEq } from "../src/cursor/awareness";
+import {
+  CursorAwareness,
+  LoroCursorPlugin,
+  cursorEq,
+} from "../src/cursor/awareness";
 import {
   ROOT_DOC_KEY,
   type LoroDocType,
@@ -26,7 +30,11 @@ const helloWorld = {
   ],
 };
 
-function makeCursorOnText(): { doc: LoroDocType; cursor: Cursor; peer: PeerID } {
+function makeCursorOnText(): {
+  doc: LoroDocType;
+  cursor: Cursor;
+  peer: PeerID;
+} {
   const doc: LoroDocType = new LoroDoc();
   updateLoroToPmState(doc, new Map(), createEditorState(schema, helloWorld));
   const root = doc.getMap(ROOT_DOC_KEY) as LoroNode;
@@ -147,11 +155,7 @@ describe("cursorEq (awareness module)", () => {
 describe("LoroCursorPlugin (integration)", () => {
   test("mounts cleanly alongside LoroSyncPlugin and survives destroy", async () => {
     const doc: LoroDocType = new LoroDoc();
-    updateLoroToPmState(
-      doc,
-      new Map(),
-      createEditorState(schema, helloWorld),
-    );
+    updateLoroToPmState(doc, new Map(), createEditorState(schema, helloWorld));
     const aware = new CursorAwareness(doc.peerIdStr);
 
     const place = document.createElement("div");

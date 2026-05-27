@@ -43,14 +43,12 @@ describe("CursorEphemeralStore", () => {
 
   test("setLocal stores anchor / focus / user; getLocal decodes", () => {
     const doc: LoroDocType = new LoroDoc();
-    updateLoroToPmState(
-      doc,
-      new Map(),
-      createEditorState(schema, helloWorld),
-    );
+    updateLoroToPmState(doc, new Map(), createEditorState(schema, helloWorld));
     const root = doc.getMap(ROOT_DOC_KEY) as LoroNode;
     const para = getLoroMapChildren(root).get(0) as LoroNode;
-    const text = getLoroMapChildren(para).get(0) as import("loro-crdt").LoroText;
+    const text = getLoroMapChildren(para).get(
+      0,
+    ) as import("loro-crdt").LoroText;
     const cursor = text.getCursor(0)!;
 
     const peer = doc.peerIdStr;
@@ -70,11 +68,7 @@ describe("CursorEphemeralStore", () => {
 
   test("getAll returns one entry per peer with decoded cursors", () => {
     const docA: LoroDocType = new LoroDoc();
-    updateLoroToPmState(
-      docA,
-      new Map(),
-      createEditorState(schema, helloWorld),
-    );
+    updateLoroToPmState(docA, new Map(), createEditorState(schema, helloWorld));
     const rootA = docA.getMap(ROOT_DOC_KEY) as LoroNode;
     const textA = getLoroMapChildren(
       getLoroMapChildren(rootA).get(0) as LoroNode,
@@ -147,11 +141,7 @@ describe("CursorEphemeralStore", () => {
 describe("LoroEphemeralCursorPlugin (integration)", () => {
   test("publishes the local user's cursor on focus and clears on blur", async () => {
     const doc: LoroDocType = new LoroDoc();
-    updateLoroToPmState(
-      doc,
-      new Map(),
-      createEditorState(schema, helloWorld),
-    );
+    updateLoroToPmState(doc, new Map(), createEditorState(schema, helloWorld));
     const peer = doc.peerIdStr;
     const store = new CursorEphemeralStore(peer);
 

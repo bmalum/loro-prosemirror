@@ -208,11 +208,7 @@ describe("cursorToAbsolutePosition", () => {
 describe("LoroEphemeralCursorPlugin (createDecorations)", () => {
   test("renders a remote peer's cursor as a widget+inline decoration set", () => {
     const docA: LoroDocType = new LoroDoc();
-    updateLoroToPmState(
-      docA,
-      new Map(),
-      createEditorState(schema, helloWorld),
-    );
+    updateLoroToPmState(docA, new Map(), createEditorState(schema, helloWorld));
 
     // PeerB simulates a remote user. We need a real Cursor that
     // points into docA's text container so decoding succeeds in
@@ -240,7 +236,10 @@ describe("LoroEphemeralCursorPlugin (createDecorations)", () => {
       state: EditorState.create({
         doc: schema.nodeFromJSON({ type: "doc", content: [] }),
         schema,
-        plugins: [LoroSyncPlugin({ doc: docA }), LoroEphemeralCursorPlugin(store, {})],
+        plugins: [
+          LoroSyncPlugin({ doc: docA }),
+          LoroEphemeralCursorPlugin(store, {}),
+        ],
       }),
     });
     try {
@@ -269,11 +268,7 @@ describe("LoroEphemeralCursorPlugin (createDecorations)", () => {
 
   test("skips peers whose anchor or focus is missing", () => {
     const docA: LoroDocType = new LoroDoc();
-    updateLoroToPmState(
-      docA,
-      new Map(),
-      createEditorState(schema, helloWorld),
-    );
+    updateLoroToPmState(docA, new Map(), createEditorState(schema, helloWorld));
     const peerA = docA.peerIdStr;
     const peerB = "9999999999" as PeerID;
 
@@ -290,7 +285,10 @@ describe("LoroEphemeralCursorPlugin (createDecorations)", () => {
       state: EditorState.create({
         doc: schema.nodeFromJSON({ type: "doc", content: [] }),
         schema,
-        plugins: [LoroSyncPlugin({ doc: docA }), LoroEphemeralCursorPlugin(store, {})],
+        plugins: [
+          LoroSyncPlugin({ doc: docA }),
+          LoroEphemeralCursorPlugin(store, {}),
+        ],
       }),
     });
     try {
