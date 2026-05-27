@@ -18,51 +18,70 @@ import {
 } from "./undo-plugin-key";
 
 type Cursors = { anchor: Cursor | null; focus: Cursor | null };
+
 export const LoroUndoPlugin = (props: LoroUndoPluginProps): Plugin => {
   const undoManager = props.undoManager || new UndoManager(props.doc, {});
-  let lastSelection: Cursors = {
-    anchor: null,
-    focus: null,
-  };
+  undoManager.addExcludeOriginPrefix("sys:init");
+
+  // Closure mirror of the latest `prevSelection` computed by `apply()`.
+  // The Loro `setOnPush` callback fires synchronously inside the apply
+  // chain (Loro events fire while updateLoroToPmState writes), at which
+  // point `view.state` has not yet been updated to include the new
+  // plugin state — so reading via `loroUndoPluginKey.getState(view.state)`
+  // would return the previous tick's value. Mirroring through this
+  // closure variable from inside apply gives `setOnPush` access to the
+  // in-flight value. See y-prosemirror's `latestPrevSel` for the same
+  // pattern.
+  let latestPrevSelection: Cursors = { anchor: null, focus: null };
+
   return new Plugin({
     key: loroUndoPluginKey,
     state: {
       init: (_config, editorState): LoroUndoPluginState => {
         configLoroTextStyle(props.doc, editorState.schema);
-
-        undoManager.addExcludeOriginPrefix("sys:init");
         return {
           undoManager,
           canUndo: undoManager.canUndo(),
           canRedo: undoManager.canRedo(),
           isUndoing: { current: false },
+          prevSelection: null,
         };
       },
-      apply: (_tr, state, oldEditorState, _newEditorState) => {
-        const undoState = loroUndoPluginKey.getState(oldEditorState);
+      apply: (
+        tr,
+        state,
+        oldEditorState,
+        _newEditorState,
+      ): LoroUndoPluginState => {
         const loroState = loroSyncPluginKey.getState(oldEditorState);
-        if (!undoState || !loroState) {
-          return state;
-        }
+        const isInternal =
+          tr.getMeta(loroSyncPluginKey) != null ||
+          tr.getMeta(loroUndoPluginKey) != null;
 
-        const canUndo = undoState.undoManager.canUndo();
-        const canRedo = undoState.undoManager.canRedo();
-        {
+        let prevSelection = state.prevSelection;
+        if (loroState != null && !isInternal) {
+          // Capture the selection BEFORE this user transaction was applied,
+          // so the next undo group can use it as the "where the cursor was
+          // before the edit" anchor.
           const { anchor, focus } = convertPmSelectionToCursors(
             oldEditorState.doc,
             oldEditorState.selection,
             loroState,
           );
-          lastSelection = {
-            anchor: anchor ?? null,
-            focus: focus ?? null,
-          };
+          prevSelection = { anchor: anchor ?? null, focus: focus ?? null };
         }
-        return {
-          ...state,
-          canUndo,
-          canRedo,
-        };
+        latestPrevSelection = prevSelection ?? { anchor: null, focus: null };
+
+        const canUndo = state.undoManager.canUndo();
+        const canRedo = state.undoManager.canRedo();
+        if (
+          canUndo === state.canUndo &&
+          canRedo === state.canRedo &&
+          prevSelection === state.prevSelection
+        ) {
+          return state;
+        }
+        return { ...state, canUndo, canRedo, prevSelection };
       },
     } as StateField<LoroUndoPluginState>,
 
@@ -70,25 +89,19 @@ export const LoroUndoPlugin = (props: LoroUndoPluginProps): Plugin => {
       undoManager.setOnPush((isUndo, _counterRange) => {
         const loroState = loroSyncPluginKey.getState(view.state);
         if (loroState?.doc == null) {
-          return {
-            value: null,
-            cursors: [],
-          };
+          return { value: null, cursors: [] };
         }
 
         const cursors: Cursor[] = [];
-        let selection = lastSelection;
+        let selection: Cursors = latestPrevSelection;
         if (!isUndo) {
-          const loroState = loroSyncPluginKey.getState(view.state);
-          if (loroState) {
-            const { anchor, focus } = convertPmSelectionToCursors(
-              view.state.doc,
-              view.state.selection,
-              loroState,
-            );
-            selection.anchor = anchor || null;
-            selection.focus = focus || null;
-          }
+          // For redo, use the current PM selection (the post-undo cursor).
+          const { anchor, focus } = convertPmSelectionToCursors(
+            view.state.doc,
+            view.state.selection,
+            loroState,
+          );
+          selection = { anchor: anchor ?? null, focus: focus ?? null };
         }
 
         if (selection.anchor) {
@@ -98,19 +111,9 @@ export const LoroUndoPlugin = (props: LoroUndoPluginProps): Plugin => {
           cursors.push(selection.focus);
         }
 
-        return {
-          value: null,
-          // The undo manager will internally transform the cursors.
-          // Undo/redo operations may recreate deleted content, so we need to remap
-          // the cursors to their new positions. Additionally, if containers are deleted
-          // and recreated, they also need remapping. Remote changes to the document
-          // should be considered in these transformations.
-          cursors,
-        };
+        return { value: null, cursors };
       });
       undoManager.setOnPop((_isUndo, meta, _counterRange) => {
-        // After this call, the `onPush` will be called immediately.
-        // The immediate `onPush` will contain the inverse operations that undone the effect caused by the current `onPop`
         const loroState = loroSyncPluginKey.getState(view.state);
         if (loroState?.doc == null) {
           return;
@@ -121,9 +124,17 @@ export const LoroUndoPlugin = (props: LoroUndoPluginProps): Plugin => {
         if (anchor == null) {
           return;
         }
-        setTimeout(() => {
+        // Defer with queueMicrotask so the selection restore runs after
+        // the non-local-updates transaction (which applied the undo'd
+        // diff back into PM) has been committed to view.state. This is
+        // a microtask not a macro-task, so any synchronous follow-up
+        // still observes the correct cursor.
+        queueMicrotask(() => {
+          if (view.isDestroyed) {
+            return;
+          }
           syncCursorsToPmSelection(view, anchor, focus);
-        }, 0);
+        });
       });
       return {
         destroy: () => {
@@ -155,11 +166,18 @@ export const undo: Command = (state, dispatch): boolean => {
     return undoState.undoManager.canUndo();
   }
 
+  // Set/clear the re-entrancy flag synchronously around the call.
+  // `undoManager.undo()` synchronously fires Loro events; the plugin's
+  // event handler dispatches a PM transaction whose appendTransaction
+  // is gated on the loroSyncPluginKey meta — so the echo loop is
+  // already prevented. The flag remains as belt-and-braces for any
+  // host that wraps this in a custom command pipeline.
   undoState.isUndoing.current = true;
-  setTimeout(() => {
+  try {
+    return undoState.undoManager.undo();
+  } finally {
     undoState.isUndoing.current = false;
-  }, 0);
-  return undoState.undoManager.undo();
+  }
 };
 
 export const redo: Command = (state, dispatch): boolean => {
@@ -173,8 +191,9 @@ export const redo: Command = (state, dispatch): boolean => {
   }
 
   undoState.isUndoing.current = true;
-  setTimeout(() => {
+  try {
+    return undoState.undoManager.redo();
+  } finally {
     undoState.isUndoing.current = false;
-  }, 0);
-  return undoState.undoManager.redo();
+  }
 };
