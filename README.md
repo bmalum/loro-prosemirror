@@ -88,17 +88,123 @@ if (tr != null) view.dispatch(tr);
 ### Observing sync events
 
 Wire `LoroSyncPluginProps.onSyncEvent` to surface incremental-vs-fallback
-metrics, fallback reasons, batch sizes etc. The hook is fired once per
-processed Loro event batch and is safe to throw from (errors are caught
-and logged):
+metrics, fallback reasons, batch sizes etc. The hook fires once per
+processed Loro event batch — plus a one-shot `init` event after the
+plugin's bootstrap dispatch — and is safe to throw from (errors are
+caught and logged):
 
 ```ts
 LoroSyncPlugin({
   doc,
   onSyncEvent: (e) => {
-    if (e.kind === "fallback") {
-      console.warn("incremental bailed:", e.reason);
+    switch (e.kind) {
+      case "init":
+        // Tells you what the bootstrap dispatch did:
+        //   "loro-populated" → Loro had content; PM was replaced.
+        //   "pm-seeded"      → PM had content + Loro empty; PM was
+        //                      written into Loro (LOCAL Loro commits
+        //                      ARE emitted in this mode — wire-push
+        //                      layers should expect them).
+        //   "both-empty"     → mapping bound, no commits emitted.
+        console.log("init mode:", e.mode);
+        break;
+      case "incremental":
+        // Surgical Steps applied. e.eventCount, e.by, e.origin.
+        break;
+      case "fallback":
+        console.warn("incremental bailed:", e.reason);
+        break;
+      case "error":
+        // e.phase: "init" | "doc-changed" | "update-state" |
+        //          "cursor-encode" | "cursor-decode" | "materialize"
+        console.error("[loro-prosemirror]", e.phase, e.error);
+        break;
     }
   },
 });
 ```
+
+### Init footprint (what the plugin does on mount)
+
+When the plugin's `view()` runs, it executes a single bootstrap
+dispatch. The dispatch sets the plugin's mapping, registers the Loro
+subscription, and either:
+
+| PM doc      | Loro doc    | Mode             | Local Loro commits during init  |
+| ----------- | ----------- | ---------------- | ------------------------------- |
+| empty       | empty       | `both-empty`     | None.                           |
+| empty       | has content | `loro-populated` | None (no-op `sys:init` commit). |
+| has content | empty       | `pm-seeded`      | One — PM written into Loro.     |
+| has content | has content | `loro-populated` | None — PM is REPLACED by Loro.  |
+
+Hosts that maintain a wire-push layer (e.g. a `subscribeLocalUpdates`
+listener that pushes ops to a server) can use the `init` event to
+distinguish expected init seeding from runtime regressions.
+
+### Custom `appendTransaction` plugins (no string hard-coding)
+
+If your editor needs an `appendTransaction` plugin that reacts to
+plugin-internal transactions — e.g. a "stamp missing block IDs"
+extension that wants to skip stamping during a Loro-driven dispatch —
+import the meta type constants instead of hard-coding strings:
+
+```ts
+import {
+  LORO_SYNC_META,
+  getLoroSyncMeta,
+  isLoroInternalTransaction,
+} from "loro-prosemirror";
+
+new Plugin({
+  appendTransaction(transactions) {
+    // Skip our work entirely on plugin-internal txs.
+    if (transactions.some(isLoroInternalTransaction)) return null;
+    // …user-edit handling
+  },
+});
+
+// Or pattern-match on the specific meta type:
+const m = getLoroSyncMeta(tr);
+if (m?.type === LORO_SYNC_META.NON_LOCAL_UPDATES) {
+  // a remote (or undo) Loro batch was applied
+}
+```
+
+### Cursor-restore opt-out for hosts with a custom restore mechanism
+
+When the incremental translator can't apply a Loro batch (rare:
+`tree` / `counter` diffs, schema-violating inserts, etc.), the plugin
+falls back to a full document rebuild. After the rebuild the plugin
+schedules a `queueMicrotask` cursor restore using Loro cursors
+captured before the dispatch.
+
+If your host editor restores the cursor itself — typically via an
+`appendTransaction` plugin that detects `LORO_SYNC_META.NON_LOCAL_UPDATES`
+and re-sets the selection synchronously inside the same tx batch — set
+`disableFallbackCursorRestore: true` so the plugin's microtask doesn't
+override your synchronous restore:
+
+```ts
+LoroSyncPlugin({ doc, disableFallbackCursorRestore: true });
+```
+
+### LoroUndoPlugin and competing history plugins
+
+`LoroUndoPlugin` does NOT bind keys; it exposes `undo`/`redo` commands
+that you wire into your keymap. Tiptap's `StarterKit` and many other
+host editors include `prosemirror-history` by default. If both are
+mounted and both are wired to the same key, the two undo stacks
+desynchronize:
+
+- `prosemirror-history` reverses local PM steps; the resulting tx
+  flows through `LoroSyncPlugin`'s `appendTransaction` and is written
+  to Loro as a NEW commit (not a Loro `UndoManager` pop).
+- Loro's `UndoManager` records all PM-history-driven txs as separate
+  commits. Calling `LoroUndoPlugin`'s `undo` then pops the wrong
+  entry and PM is out of sync with the Loro op log.
+
+`LoroUndoPlugin` logs a `console.warn` on mount when it detects a
+competing `history$`-keyed plugin. The fix is host-side: either
+disable the PM history plugin (`StarterKit.configure({ history: false })`)
+or rely on PM history alone and don't call `undo`/`redo` from this
+binding.
