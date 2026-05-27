@@ -30,6 +30,21 @@ All notable changes to this project will be documented in this file. See [standa
 - Route `event.by === "checkout"` batches to the safety-net rebuild
   unconditionally; checkout shapes can rewrite the doc and have not
   been benchmarked end-to-end on the incremental path.
+- Validate every list-insert with `parent.canReplace(...)` before
+  `tr.insert`. Without the guard, ProseMirror's auto-fitting logic
+  could silently lift a schema-violating insertion to a level where it
+  fits, leaving the PM doc structurally divergent from Loro. The
+  binding now bails to the safety-net rebuild instead.
+- List-insert mapping mutations are now atomic: bindings produced by
+  `materializeInsertedContainer` are written to a scratch map and
+  merged into the shared mapping only after the `tr.insert` succeeds.
+- `findEmptyTextPosition` is guarded against the (narrow) case where a
+  prior event in the same batch mutated the empty LoroText's parent
+  block's children list — the post-batch Loro list could otherwise
+  silently shift the offset.
+- The `applyTextDiff` empty-LoroText fallback now refuses
+  `retain`/`delete` ops, since a fully-emptied pre-batch text run has
+  nothing to retain or delete.
 - Carry batch context (`by`, `origin`, event count, first target,
   first diff type) in the error log emitted when the translator
   throws — significantly easier to debug from production traces.

@@ -120,8 +120,16 @@ export function findContainerLocation(
  * (typically because `updateLoroToPmState` pruned it after the LoroText
  * was fully emptied).
  *
- * The position is computed by walking the parent block's children list
- * in Loro and summing the PM `nodeSize` of the preceding mapped children.
+ * The position is computed by walking the parent block's children list in
+ * Loro and summing the PM `nodeSize` of the preceding mapped children.
+ *
+ * IMPORTANT: this function must NOT be called when the parent block's
+ * children list has been mutated earlier in the same event batch — the
+ * walk uses Loro's post-batch state but the returned position is in
+ * pre-batch PM coordinates, and a sibling insert/delete in this batch
+ * would silently shift the offset. Callers must guard with
+ * `parentTouchedInBatch` (see {@link loroEventBatchToTransaction}).
+ *
  * Returns `null` if the parent block is itself unmapped or the text
  * container is no longer in its parent.
  */
@@ -207,10 +215,9 @@ export function loroEventBatchToTransaction(
   doc: LoroDocType,
 ): Transaction | null {
   // Checkout events can carry diffs that essentially rewrite the document
-  // (e.g. timeline scrubbing in a history viewer). The translator handles
-  // most cases correctly, but we have not benchmarked it for this shape;
-  // until we do, route checkouts through the safety-net rebuild. We check
-  // this before the empty-batch shortcut so a buggy synthetic batch with
+  // (e.g. timeline scrubbing in a history viewer). Until we benchmark
+  // them, route all checkouts through the safety-net rebuild. This check
+  // is placed before the empty-batch shortcut so a synthetic batch with
   // by:"checkout" can't slip through.
   if (batch.by === "checkout") {
     return null;
@@ -225,11 +232,25 @@ export function loroEventBatchToTransaction(
   // skipped because the materialised PM subtree already reflects Loro's
   // post-batch state.
   const materialisedInBatch = new Set<ContainerID>();
+  // Parent block ContainerIDs whose children list was mutated by some
+  // earlier event in the batch (insert or delete). We use this to guard
+  // findEmptyTextPosition, which only computes a correct offset when
+  // the parent's children list has not been touched in this batch.
+  const parentTouchedInBatch = new Set<ContainerID>();
+
   for (const event of batch.events) {
     if (materialisedInBatch.has(event.target)) {
       continue;
     }
-    const ok = applyEvent(tr, state, event, mapping, doc, materialisedInBatch);
+    const ok = applyEvent(
+      tr,
+      state,
+      event,
+      mapping,
+      doc,
+      materialisedInBatch,
+      parentTouchedInBatch,
+    );
     if (!ok) {
       return null;
     }
@@ -244,10 +265,19 @@ function applyEvent(
   mapping: LoroNodeMapping,
   doc: LoroDocType,
   materialisedInBatch: Set<ContainerID>,
+  parentTouchedInBatch: Set<ContainerID>,
 ): boolean {
   switch (event.diff.type) {
     case "text":
-      return applyTextDiff(tr, state, event.target, event.diff, mapping, doc);
+      return applyTextDiff(
+        tr,
+        state,
+        event.target,
+        event.diff,
+        mapping,
+        doc,
+        parentTouchedInBatch,
+      );
     case "list":
       return applyListDiff(
         tr,
@@ -257,6 +287,7 @@ function applyEvent(
         mapping,
         doc,
         materialisedInBatch,
+        parentTouchedInBatch,
       );
     case "map":
       return applyMapDiff(tr, state, event.target, event.diff, mapping, doc);
@@ -277,20 +308,37 @@ function applyTextDiff(
   diff: TextDiff,
   mapping: LoroNodeMapping,
   doc: LoroDocType,
+  parentTouchedInBatch: Set<ContainerID>,
 ): boolean {
   const loc = findContainerLocation(state.doc, target, mapping);
   let prePos: number;
+  let usedFallback = false;
   if (loc != null && loc.isText) {
     prePos = loc.pos;
   } else if (loc == null) {
     // Mapping miss: typical when the LoroText was emptied earlier in this
     // session and `updateLoroToPmState` pruned the entry. Walk to the
-    // parent block to recover the insertion point.
+    // parent block to recover the insertion point — but only when no
+    // sibling was added/removed in THIS batch (see
+    // findEmptyTextPosition's docs for why).
+    const text = doc.getContainerById(target);
+    if (!(text instanceof LoroText)) {
+      return false;
+    }
+    const parentList = text.parent();
+    const parentBlock = parentList?.parent();
+    if (
+      parentBlock instanceof LoroMap &&
+      parentTouchedInBatch.has(parentBlock.id)
+    ) {
+      return false;
+    }
     const fallback = findEmptyTextPosition(state.doc, target, mapping, doc);
     if (fallback == null) {
       return false;
     }
     prePos = fallback;
+    usedFallback = true;
   } else {
     // Container was found but isn't a text run — schema mismatch.
     return false;
@@ -299,6 +347,12 @@ function applyTextDiff(
   let cursor = tr.mapping.map(prePos);
   for (const op of diff.diff as Delta<string>[]) {
     if (op.retain != null) {
+      // Pre-batch text was empty (otherwise the mapping wouldn't have
+      // been pruned), so `retain`/`delete` make no sense in the
+      // fallback path. Bail rather than risk corruption.
+      if (usedFallback) {
+        return false;
+      }
       if (op.attributes) {
         if (
           !applyMarkAttributes(
@@ -324,6 +378,9 @@ function applyTextDiff(
       tr.insert(cursor, textNode);
       cursor += op.insert.length;
     } else if (op.delete != null) {
+      if (usedFallback) {
+        return false;
+      }
       tr.delete(cursor, cursor + op.delete);
     } else {
       return false;
@@ -358,11 +415,6 @@ function attributesToMarks(
 
 /**
  * Apply a mark-attribute change over `[from, to)`.
- *
- * For each entry `[name, value]`:
- *   - `value === null` removes all marks of that type from the range
- *   - any other value adds the mark with the given attrs (replacing any
- *     prior mark of the same type by PM's mark-dedup rules).
  */
 function applyMarkAttributes(
   tr: Transaction,
@@ -411,6 +463,7 @@ function applyListDiff(
   mapping: LoroNodeMapping,
   doc: LoroDocType,
   materialisedInBatch: Set<ContainerID>,
+  parentTouchedInBatch: Set<ContainerID>,
 ): boolean {
   const loroList = doc.getContainerById(target);
   if (!(loroList instanceof LoroList)) {
@@ -437,6 +490,7 @@ function applyListDiff(
 
   let listIdx = 0;
   let pmCursor = 0;
+  let listChanged = false;
 
   for (const op of diff.diff) {
     if (op.retain != null) {
@@ -449,16 +503,14 @@ function applyListDiff(
       }
     } else if (op.delete != null) {
       let removedSize = 0;
+      const subtreesToPrune: (Node | Node[])[] = [];
       for (let i = 0; i < op.delete; i++) {
         if (listIdx >= items.length) {
           return false;
         }
         const item = items[listIdx];
         removedSize += item.pmEnd - item.pmStart;
-        // Prune mapping for everything inside the about-to-delete subtree
-        // so we don't leak entries pointing at Nodes that no longer live
-        // in the PM doc.
-        pruneSubtreeFromMapping(item.pmNode, mapping);
+        subtreesToPrune.push(item.pmNode);
         listIdx++;
       }
       if (removedSize > 0) {
@@ -466,19 +518,34 @@ function applyListDiff(
           contentStart + pmCursor,
           contentStart + pmCursor + removedSize,
         );
+        for (const subtree of subtreesToPrune) {
+          pruneSubtreeFromMapping(subtree, mapping);
+        }
+        listChanged = true;
       }
     } else if (op.insert != null) {
       const inserted = op.insert as (Value | Container)[];
+
+      // Build the fragment in a *scratch* mapping copy so we don't pollute
+      // `mapping` if validation fails. createNodeFromLoroObj uses `get` for
+      // memoisation and `set` for new bindings, so the scratch needs to
+      // contain every existing entry.
+      const scratchMapping: LoroNodeMapping = new Map(mapping);
       const fragments: Node[] = [];
+      const newlyMaterialised: Container[] = [];
       for (const value of inserted) {
         if (!isContainer(value)) {
           return false;
         }
-        const node = materializeInsertedContainer(state.schema, value, mapping);
+        const node = materializeInsertedContainer(
+          state.schema,
+          value,
+          scratchMapping,
+        );
         if (node == null) {
           return false;
         }
-        collectContainerIds(value, materialisedInBatch);
+        newlyMaterialised.push(value);
         if (Array.isArray(node)) {
           for (const n of node) fragments.push(n);
         } else {
@@ -486,11 +553,39 @@ function applyListDiff(
         }
       }
       const fragment = Fragment.from(fragments);
-      tr.insert(contentStart + pmCursor, fragment);
+
+      // Validate that the fragment can fit at the target position. If
+      // PM would have to "open"/lift content for the insertion to be
+      // valid, we'd diverge from Loro silently — better to bail to the
+      // safety-net rebuild.
+      const insertPos = contentStart + pmCursor;
+      let $pos;
+      try {
+        $pos = tr.doc.resolve(insertPos);
+      } catch {
+        return false;
+      }
+      if (!$pos.parent.canReplace($pos.index(), $pos.index(), fragment)) {
+        return false;
+      }
+
+      // Commit: insert the fragment and merge the scratch mapping back.
+      tr.insert(insertPos, fragment);
+      for (const [k, v] of scratchMapping) {
+        mapping.set(k, v);
+      }
+      for (const container of newlyMaterialised) {
+        collectContainerIds(container, materialisedInBatch);
+      }
       pmCursor += fragment.size;
+      listChanged = true;
     } else {
       return false;
     }
+  }
+
+  if (listChanged) {
+    parentTouchedInBatch.add(parentMap.id);
   }
   return true;
 }
@@ -535,8 +630,8 @@ function snapshotChildren(parent: Node): ListItemSnapshot[] {
  * For block PM Nodes we look up the ContainerID in the
  * `WEAK_NODE_TO_LORO_CONTAINER_MAPPING` reverse index and prune by id
  * (and recurse into block children). For text runs we scan `mapping`
- * for the entry whose value is the array of text nodes — O(n) but only
- * happens on delete.
+ * for the entry whose value is the array of text nodes — O(n) per run
+ * but only triggered on delete.
  */
 function pruneSubtreeFromMapping(
   pmNode: Node | Node[],
