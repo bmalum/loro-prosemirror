@@ -210,7 +210,15 @@ function init(view: EditorView, props: LoroSyncPluginProps): () => void {
     return () => {};
   }
 
-  const state = loroSyncPluginKey.getState(view.state) as LoroSyncPluginState;
+  const state = loroSyncPluginKey.getState(view.state);
+  if (state == null) {
+    // The plugin's `state.init` should have populated this before
+    // `view()` runs. If it didn't, something is very wrong — but we
+    // throw rather than silently no-op so it's loud during development.
+    throw new Error(
+      "[loro-prosemirror] LoroSyncPlugin state was not initialised before view() ran",
+    );
+  }
 
   // Subscribe FIRST so we don't miss events emitted by our own bootstrap
   // commit. The subscription handler (updateNodeOnLoroEvent) filters
@@ -356,7 +364,13 @@ function updateNodeOnLoroEvent(view: EditorView, event: LoroEventBatch) {
     return;
   }
 
-  const state = loroSyncPluginKey.getState(view.state) as LoroSyncPluginState;
+  const state = loroSyncPluginKey.getState(view.state);
+  if (state == null) {
+    // Plugin state was never initialized OR has already been torn
+    // down. Either way we have no logger / onSyncEvent / mapping to
+    // work with — silently ignore the event.
+    return;
+  }
   if (event.by === "local" && event.origin !== "undo") {
     // Our own write that doesn't come from an undo replay. The PM dispatch
     // that produced this Loro change has already updated the editor; we
