@@ -1,6 +1,7 @@
 import { describe, expect, test } from "vitest";
 
-import { LoroDoc, LoroMap } from "loro-crdt";
+import { LoroDoc, type LoroEventBatch, LoroMap, LoroText } from "loro-crdt";
+import { TextSelection } from "prosemirror-state";
 
 import {
   findContainerLocation,
@@ -23,7 +24,6 @@ import {
   insertLoroMap,
   insertLoroText,
   oneMs,
-  setupLoroMap,
 } from "./utils";
 
 const helloWorldDoc = {
@@ -41,50 +41,29 @@ const helloWorldDoc = {
 };
 
 /**
- * Build a `(LoroDoc, EditorState, mapping)` triple where the Loro doc and the
- * editor state are in sync. This is the precondition for incremental sync:
- * the mapping is fresh, every container in Loro has a PM Node twin.
+ * Build a `(LoroDoc, EditorState, mapping)` triple where the Loro doc and
+ * the editor state are in sync. The mapping uses identity-bound PM Node
+ * references so `findContainerLocation` can resolve them by `===`.
  */
 function buildSyncedFixture(content: any) {
   const editorState = createEditorState(schema, content);
   const loroDoc: LoroDocType = new LoroDoc();
-  const mapping: LoroNodeMapping = new Map();
-  updateLoroToPmState(loroDoc, mapping, editorState);
+  const seedMapping: LoroNodeMapping = new Map();
+  updateLoroToPmState(loroDoc, seedMapping, editorState);
 
-  // Re-create the PM doc from Loro to populate the mapping with the same
-  // Node references that the next call to `createNodeFromLoroObj` would.
   const innerDoc = loroDoc.getMap(ROOT_DOC_KEY);
   const node = createNodeFromLoroObj(
     schema,
     innerDoc as LoroMap<LoroNodeContainerType>,
-    mapping,
+    new Map(),
   );
   const syncedState = createEditorState(schema, node.toJSON());
 
-  // Repopulate the mapping against the freshly created PM nodes used by the
-  // editor state, so that mapping → editor state is in agreement.
-  const repopMapping: LoroNodeMapping = new Map();
-  createNodeFromLoroObj(
-    schema,
-    innerDoc as LoroMap<LoroNodeContainerType>,
-    repopMapping,
-  );
-
-  // The mapping built by the second create call references nodes that are
-  // *equivalent* to the editor state nodes but not identical. To get
-  // identity-based lookup, walk the editor state and re-bind containers in
-  // PM order.
-  const rebound = rebindMapping(syncedState.doc, innerDoc as LoroNode);
-
-  return { loroDoc, editorState: syncedState, mapping: rebound };
+  // Bind containers to the editor-state Node instances by structural walk.
+  const mapping = rebindMapping(syncedState.doc, innerDoc as LoroNode);
+  return { loroDoc, editorState: syncedState, mapping };
 }
 
-/**
- * Walk a PM doc and a Loro inner-doc tree in lockstep, binding each Loro
- * container ID to the PM node that occupies the same slot. Used by the
- * test fixture to produce a mapping whose Node references are identical
- * (===) to the ones inside `pmDoc`.
- */
 function rebindMapping(
   pmDoc: import("prosemirror-model").Node,
   loroInner: LoroNode,
@@ -98,15 +77,10 @@ function rebindMapping(
     for (let li = 0; li < loroChildren.length; li++) {
       const loroChild = loroChildren.get(li);
       if (loroChild instanceof LoroMap) {
-        // Block child: find the matching PM child.
-        if (pmIndex >= pmNode.childCount) {
-          break;
-        }
+        if (pmIndex >= pmNode.childCount) break;
         walk(pmNode.child(pmIndex), loroChild as LoroNode);
         pmIndex++;
       } else {
-        // Inline text run: collect contiguous PM text nodes into an array
-        // bound to this LoroText container.
         const textNodes: import("prosemirror-model").Node[] = [];
         while (pmIndex < pmNode.childCount && pmNode.child(pmIndex).isText) {
           textNodes.push(pmNode.child(pmIndex));
@@ -121,6 +95,19 @@ function rebindMapping(
 
   walk(pmDoc, loroInner);
   return mapping;
+}
+
+/**
+ * Helper that captures the next event batch produced by a Loro mutation.
+ * Returns `[batches, dispose]` so tests can subscribe once and snapshot.
+ */
+function captureEvents(loroDoc: LoroDocType): {
+  batches: LoroEventBatch[];
+  dispose: () => void;
+} {
+  const batches: LoroEventBatch[] = [];
+  const unsubscribe = loroDoc.subscribe((batch) => batches.push(batch));
+  return { batches, dispose: unsubscribe };
 }
 
 describe("findContainerLocation", () => {
@@ -144,15 +131,11 @@ describe("findContainerLocation", () => {
 
     expect(firstLoc).not.toBeNull();
     expect(secondLoc).not.toBeNull();
-    expect(firstLoc!.isText).toBe(false);
-    expect(secondLoc!.isText).toBe(false);
-    // First paragraph is at position 0 in the doc.
     expect(firstLoc!.pos).toBe(0);
-    // Second paragraph follows the first (which has 11 text chars + open/close = 13).
     expect(secondLoc!.pos).toBe(editorState.doc.child(0).nodeSize);
   });
 
-  test("locates a text container as the parent block's content offset", () => {
+  test("locates a text container at the parent block's content offset", () => {
     const { loroDoc, editorState, mapping } = buildSyncedFixture(helloWorldDoc);
     const innerDoc = loroDoc.getMap(ROOT_DOC_KEY) as LoroNode;
     const firstParagraph = getLoroMapChildren(innerDoc).get(0) as LoroNode;
@@ -161,15 +144,11 @@ describe("findContainerLocation", () => {
     const loc = findContainerLocation(editorState.doc, firstText.id, mapping);
     expect(loc).not.toBeNull();
     expect(loc!.isText).toBe(true);
-    // Parent paragraph is at pos 0, its content starts at pos 1.
     expect(loc!.pos).toBe(1);
   });
 
   test("returns null for a container that has no PM mapping yet", () => {
     const { loroDoc, editorState, mapping } = buildSyncedFixture(helloWorldDoc);
-    // Create a brand-new container in Loro but do NOT register it in the
-    // mapping — this simulates a container that has just arrived from a
-    // remote update before the parent walk has materialised it.
     const innerDoc = loroDoc.getMap(ROOT_DOC_KEY) as LoroNode;
     const newPara = insertLoroMap(getLoroMapChildren(innerDoc), "paragraph");
     insertLoroText(getLoroMapChildren(newPara));
@@ -180,42 +159,238 @@ describe("findContainerLocation", () => {
   });
 });
 
-describe("loroEventBatchToTransaction (Phase 1)", () => {
-  test("returns a no-op transaction for an empty batch", () => {
-    const { editorState, mapping } = buildSyncedFixture(helloWorldDoc);
-    const tr = loroEventBatchToTransaction(
-      editorState,
-      {
-        by: "import",
-        events: [],
-        from: [],
-        to: [],
-      },
-      mapping,
-    );
-    expect(tr).not.toBeNull();
-    expect(tr!.docChanged).toBe(false);
-  });
-
-  test("returns null when any event has not yet been implemented", async () => {
+describe("loroEventBatchToTransaction (text)", () => {
+  test("translates an insert at the start of a paragraph", async () => {
     const { loroDoc, editorState, mapping } = buildSyncedFixture(helloWorldDoc);
+    const { batches, dispose } = captureEvents(loroDoc);
+
     const innerDoc = loroDoc.getMap(ROOT_DOC_KEY) as LoroNode;
     const firstPara = getLoroMapChildren(innerDoc).get(0) as LoroNode;
-    const firstText = getLoroMapChildren(firstPara).get(0);
-
-    // Capture the next event batch and feed it to the translator.
-    const batches: import("loro-crdt").LoroEventBatch[] = [];
-    const unsubscribe = loroDoc.subscribe((batch) => batches.push(batch));
-
-    (firstText as import("loro-crdt").LoroText).insert(5, "X");
+    const firstText = getLoroMapChildren(firstPara).get(0) as LoroText;
+    firstText.insert(0, "Oh ");
     loroDoc.commit();
     await oneMs();
-    unsubscribe();
+    dispose();
 
     expect(batches.length).toBeGreaterThan(0);
     const tr = loroEventBatchToTransaction(editorState, batches[0], mapping);
-    // Phase 1 has no diff translators implemented, so any non-empty diff
-    // returns null — caller will fall back to full replace.
-    expect(tr).toBeNull();
+    expect(tr).not.toBeNull();
+    expect(tr!.docChanged).toBe(true);
+
+    const newState = editorState.apply(tr!);
+    expect(newState.doc.child(0).textContent).toBe("Oh Hello world");
+  });
+
+  test("translates an insert in the middle of a paragraph", async () => {
+    const { loroDoc, editorState, mapping } = buildSyncedFixture(helloWorldDoc);
+    const { batches, dispose } = captureEvents(loroDoc);
+
+    const innerDoc = loroDoc.getMap(ROOT_DOC_KEY) as LoroNode;
+    const firstText = getLoroMapChildren(
+      getLoroMapChildren(innerDoc).get(0) as LoroNode,
+    ).get(0) as LoroText;
+    firstText.insert(5, " there");
+    loroDoc.commit();
+    await oneMs();
+    dispose();
+
+    const tr = loroEventBatchToTransaction(editorState, batches[0], mapping);
+    expect(tr).not.toBeNull();
+    const newState = editorState.apply(tr!);
+    expect(newState.doc.child(0).textContent).toBe("Hello there world");
+  });
+
+  test("translates a delete in the middle of a paragraph", async () => {
+    const { loroDoc, editorState, mapping } = buildSyncedFixture(helloWorldDoc);
+    const { batches, dispose } = captureEvents(loroDoc);
+
+    const innerDoc = loroDoc.getMap(ROOT_DOC_KEY) as LoroNode;
+    const firstText = getLoroMapChildren(
+      getLoroMapChildren(innerDoc).get(0) as LoroNode,
+    ).get(0) as LoroText;
+    firstText.delete(5, 6); // delete " world"
+    loroDoc.commit();
+    await oneMs();
+    dispose();
+
+    const tr = loroEventBatchToTransaction(editorState, batches[0], mapping);
+    expect(tr).not.toBeNull();
+    const newState = editorState.apply(tr!);
+    expect(newState.doc.child(0).textContent).toBe("Hello");
+  });
+
+  test("translates an edit in a non-first paragraph", async () => {
+    const { loroDoc, editorState, mapping } = buildSyncedFixture(helloWorldDoc);
+    const { batches, dispose } = captureEvents(loroDoc);
+
+    const innerDoc = loroDoc.getMap(ROOT_DOC_KEY) as LoroNode;
+    const secondText = getLoroMapChildren(
+      getLoroMapChildren(innerDoc).get(1) as LoroNode,
+    ).get(0) as LoroText;
+    secondText.insert(6, " paragraph");
+    loroDoc.commit();
+    await oneMs();
+    dispose();
+
+    const tr = loroEventBatchToTransaction(editorState, batches[0], mapping);
+    expect(tr).not.toBeNull();
+    const newState = editorState.apply(tr!);
+    expect(newState.doc.child(0).textContent).toBe("Hello world");
+    expect(newState.doc.child(1).textContent).toBe("Second paragraph");
+  });
+
+  test("preserves a local cursor through a remote insert before it", async () => {
+    const { loroDoc, editorState, mapping } = buildSyncedFixture(helloWorldDoc);
+
+    // Place the local cursor at the end of the first paragraph (pos 12).
+    const cursorPos = 1 + "Hello world".length;
+    const stateWithSelection = editorState.apply(
+      editorState.tr.setSelection(
+        TextSelection.create(editorState.doc, cursorPos),
+      ),
+    );
+    expect(stateWithSelection.selection.from).toBe(cursorPos);
+
+    const { batches, dispose } = captureEvents(loroDoc);
+    const innerDoc = loroDoc.getMap(ROOT_DOC_KEY) as LoroNode;
+    const firstText = getLoroMapChildren(
+      getLoroMapChildren(innerDoc).get(0) as LoroNode,
+    ).get(0) as LoroText;
+    firstText.insert(0, "Oh ");
+    loroDoc.commit();
+    await oneMs();
+    dispose();
+
+    const tr = loroEventBatchToTransaction(
+      stateWithSelection,
+      batches[0],
+      mapping,
+    );
+    expect(tr).not.toBeNull();
+    const newState = stateWithSelection.apply(tr!);
+    // PM's selection mapping must shift the cursor by 3 ("Oh ".length).
+    expect(newState.selection.from).toBe(cursorPos + 3);
+    expect(newState.doc.child(0).textContent).toBe("Oh Hello world");
+  });
+
+  test("translates a mark-add as an AddMarkStep over the affected range", async () => {
+    const { loroDoc, editorState, mapping } = buildSyncedFixture(helloWorldDoc);
+    const { batches, dispose } = captureEvents(loroDoc);
+
+    const innerDoc = loroDoc.getMap(ROOT_DOC_KEY) as LoroNode;
+    const firstText = getLoroMapChildren(
+      getLoroMapChildren(innerDoc).get(0) as LoroNode,
+    ).get(0) as LoroText;
+    // Bold "world".
+    firstText.mark({ start: 6, end: 11 }, "bold", true);
+    loroDoc.commit();
+    await oneMs();
+    dispose();
+
+    const tr = loroEventBatchToTransaction(editorState, batches[0], mapping);
+    expect(tr).not.toBeNull();
+    const newState = editorState.apply(tr!);
+
+    // First paragraph should now have three text nodes: "Hello ", bold "world", "".
+    const firstPara = newState.doc.child(0);
+    let foundBold = false;
+    firstPara.forEach((child) => {
+      if (
+        child.text === "world" &&
+        child.marks.some((m) => m.type.name === "bold")
+      ) {
+        foundBold = true;
+      }
+    });
+    expect(foundBold).toBe(true);
+  });
+
+  test("translates a mark-remove (null attribute) as a RemoveMarkStep", async () => {
+    const fixtureContent = {
+      type: "doc",
+      content: [
+        {
+          type: "paragraph",
+          content: [
+            { type: "text", text: "Hello " },
+            {
+              type: "text",
+              text: "world",
+              marks: [{ type: "bold" }],
+            },
+          ],
+        },
+      ],
+    };
+    const { loroDoc, editorState, mapping } =
+      buildSyncedFixture(fixtureContent);
+    const { batches, dispose } = captureEvents(loroDoc);
+
+    const innerDoc = loroDoc.getMap(ROOT_DOC_KEY) as LoroNode;
+    const firstText = getLoroMapChildren(
+      getLoroMapChildren(innerDoc).get(0) as LoroNode,
+    ).get(0) as LoroText;
+    // Unbold "world".
+    firstText.unmark({ start: 6, end: 11 }, "bold");
+    loroDoc.commit();
+    await oneMs();
+    dispose();
+
+    const tr = loroEventBatchToTransaction(editorState, batches[0], mapping);
+    expect(tr).not.toBeNull();
+    const newState = editorState.apply(tr!);
+    const firstPara = newState.doc.child(0);
+    let anyBold = false;
+    firstPara.forEach((child) => {
+      if (child.marks.some((m) => m.type.name === "bold")) anyBold = true;
+    });
+    expect(anyBold).toBe(false);
+    expect(firstPara.textContent).toBe("Hello world");
+  });
+
+  test("handles a remote edit imported into a peer", async () => {
+    // Two peers synced. Peer B types something. Peer A imports the update.
+    // The import-induced event batch on A must translate cleanly into PM
+    // steps that bring A's editor state in line with A's post-import Loro.
+    const docA: LoroDocType = new LoroDoc();
+    const docB: LoroDocType = new LoroDoc();
+
+    const seedState = createEditorState(schema, helloWorldDoc);
+    const seedMapping: LoroNodeMapping = new Map();
+    updateLoroToPmState(docA, seedMapping, seedState);
+    docB.import(docA.export({ mode: "snapshot" }));
+
+    const innerA = docA.getMap(ROOT_DOC_KEY);
+    const nodeA = createNodeFromLoroObj(
+      schema,
+      innerA as LoroMap<LoroNodeContainerType>,
+      new Map(),
+    );
+    const editorStateA = createEditorState(schema, nodeA.toJSON());
+    const mappingA = rebindMapping(editorStateA.doc, innerA as LoroNode);
+
+    // B makes a remote edit.
+    const innerB = docB.getMap(ROOT_DOC_KEY);
+    const textB = getLoroMapChildren(
+      getLoroMapChildren(innerB as LoroNode).get(0) as LoroNode,
+    ).get(0) as LoroText;
+    textB.insert(11, " from B");
+    docB.commit();
+
+    // A imports B's update. Capture only the import-induced batch so a
+    // possible re-emission of A's earlier local commits doesn't confuse us.
+    const batches: LoroEventBatch[] = [];
+    const unsub = docA.subscribe((batch) => {
+      if (batch.by === "import") batches.push(batch);
+    });
+    docA.import(docB.export({ mode: "update", from: docA.version() }));
+    await oneMs();
+    unsub();
+
+    expect(batches.length).toBeGreaterThan(0);
+    const tr = loroEventBatchToTransaction(editorStateA, batches[0], mappingA);
+    expect(tr).not.toBeNull();
+    const newState = editorStateA.apply(tr!);
+    expect(newState.doc.child(0).textContent).toBe("Hello world from B");
   });
 });
