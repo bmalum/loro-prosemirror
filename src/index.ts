@@ -48,6 +48,7 @@ export {
 export { CursorAwareness, LoroCursorPlugin } from "./cursor/awareness";
 export { LoroUndoPlugin, undo, redo, canUndo, canRedo } from "./undo-plugin";
 export { loroUndoPluginKey, type LoroUndoPluginProps } from "./undo-plugin-key";
+export { diffPmDocs, nodeToDelta, deltaToPSteps } from "./pm-diff";
 export {
   type LoroLogLevel,
   type LoroLogger,

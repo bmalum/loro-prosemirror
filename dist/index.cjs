@@ -1,10 +1,39 @@
 Object.defineProperty(exports, Symbol.toStringTag, { value: 'Module' });
+//#region \0rolldown/runtime.js
+var __create = Object.create;
+var __defProp = Object.defineProperty;
+var __getOwnPropDesc = Object.getOwnPropertyDescriptor;
+var __getOwnPropNames = Object.getOwnPropertyNames;
+var __getProtoOf = Object.getPrototypeOf;
+var __hasOwnProp = Object.prototype.hasOwnProperty;
+var __copyProps = (to, from, except, desc) => {
+	if (from && typeof from === "object" || typeof from === "function") {
+		for (var keys = __getOwnPropNames(from), i = 0, n = keys.length, key; i < n; i++) {
+			key = keys[i];
+			if (!__hasOwnProp.call(to, key) && key !== except) {
+				__defProp(to, key, {
+					get: ((k) => from[k]).bind(null, key),
+					enumerable: !(desc = __getOwnPropDesc(from, key)) || desc.enumerable
+				});
+			}
+		}
+	}
+	return to;
+};
+var __toESM = (mod, isNodeMode, target) => (target = mod != null ? __create(__getProtoOf(mod)) : {}, __copyProps(isNodeMode || !mod || !mod.__esModule ? __defProp(target, "default", {
+	value: mod,
+	enumerable: true
+}) : target, mod));
+
+//#endregion
 let prosemirror_model = require("prosemirror-model");
 let prosemirror_state = require("prosemirror-state");
 let loro_crdt = require("loro-crdt");
 let prosemirror_view = require("prosemirror-view");
 let lib0_diff = require("lib0/diff");
 let lib0_function = require("lib0/function");
+let lib0_delta = require("lib0/delta");
+lib0_delta = __toESM(lib0_delta);
 
 //#region src/lib.ts
 const ROOT_DOC_KEY = "doc";
@@ -1871,6 +1900,160 @@ const redo = (state, dispatch) => {
 };
 
 //#endregion
+//#region src/pm-diff.ts
+/**
+* pm-diff.ts — Minimal diff between two ProseMirror documents as real PM steps.
+*
+* Ported from y-prosemirror (src/sync-utils.js) by the Super Loop team.
+* Original: https://github.com/yjs/y-prosemirror
+*
+* Key functions:
+*   nodeToDelta(node)          — convert a PM node to a lib0 delta
+*   deltaToPSteps(tr, diff)    — apply a delta diff as real PM steps
+*   diffPmDocs(tr, old, new)   — compute diff and apply as PM steps
+*
+* Using real PM steps (ReplaceStep, AddMarkStep, etc.) means PM's native
+* selection mapping handles cursor preservation automatically — no cursor
+* guard or queueMicrotask needed.
+*/
+const marksToFormat = (marks) => {
+	if (marks.length === 0) return null;
+	const fmt = {};
+	marks.forEach((m) => {
+		fmt[m.type.name] = m.attrs;
+	});
+	return fmt;
+};
+const formatToMarks = (fmt, schema) => {
+	if (!fmt) return [];
+	return Object.entries(fmt).filter(([, v]) => v != null).map(([k, v]) => schema.mark(k, v)).filter(Boolean);
+};
+/**
+* Convert a ProseMirror node to a lib0 delta.
+* Text nodes → text ops. Block nodes → insert ops with nested delta.
+*/
+function nodeToDelta(node) {
+	const d = lib0_delta.create(node.type.name);
+	Object.entries(node.attrs).forEach(([k, v]) => {
+		if (v != null) d.attrs[k] = v;
+	});
+	node.content.forEach((child) => {
+		if (child.isText) d.insert(child.text ?? "", marksToFormat(child.marks));
+		else d.insert([nodeToDelta(child)], marksToFormat(child.marks));
+	});
+	return d.done(false);
+}
+/**
+* Apply a lib0 delta diff as real ProseMirror steps on the transaction.
+* Adapted from y-prosemirror's deltaToPSteps.
+*/
+function deltaToPSteps(tr, d, pnode = tr.doc, currPos = { i: 0 }) {
+	const schema = tr.doc.type.schema;
+	let currParentIndex = 0;
+	let nOffset = 0;
+	const pchildren = pnode.content.content;
+	for (const [k, v] of Object.entries(d.attrs ?? {})) tr.setNodeAttribute(currPos.i - 1, k, v);
+	for (const op of d.children) if (lib0_delta.$retainOp.check(op)) {
+		let i = op.retain;
+		while (i > 0) {
+			const pc = pchildren[currParentIndex];
+			if (!pc) throw new Error("[pm-diff] retain out of bounds");
+			if (pc.isText) {
+				if (op.format != null) {
+					const from = currPos.i;
+					const to = currPos.i + Math.min(pc.nodeSize - nOffset, i);
+					Object.entries(op.format).forEach(([k, v]) => {
+						if (v == null) tr.removeMark(from, to, schema.marks[k]);
+						else tr.addMark(from, to, schema.mark(k, v));
+					});
+				}
+				if (i + nOffset < pc.nodeSize) {
+					nOffset += i;
+					currPos.i += i;
+					i = 0;
+				} else {
+					currParentIndex++;
+					i -= pc.nodeSize - nOffset;
+					currPos.i += pc.nodeSize - nOffset;
+					nOffset = 0;
+				}
+			} else {
+				currParentIndex++;
+				currPos.i += pc.nodeSize;
+				i--;
+			}
+		}
+	} else if (lib0_delta.$modifyOp.check(op)) {
+		const child = pchildren[currParentIndex++];
+		const childStart = currPos.i;
+		const sizeBefore = tr.doc.content.size;
+		currPos.i = childStart + 1;
+		deltaToPSteps(tr, op.value, child, currPos);
+		const netChange = tr.doc.content.size - sizeBefore;
+		currPos.i = childStart + child.nodeSize + netChange;
+	} else if (lib0_delta.$insertOp.check(op)) {
+		const newNodes = op.insert.map((ins) => deltaToPNode(ins, schema, op.format));
+		tr.replace(currPos.i, currPos.i, new prosemirror_model.Slice(prosemirror_model.Fragment.from(newNodes), 0, 0));
+		currPos.i += newNodes.reduce((s, c) => c.nodeSize + s, 0);
+	} else if (lib0_delta.$textOp.check(op)) {
+		const marks = formatToMarks(op.format, schema);
+		tr.replace(currPos.i, currPos.i, new prosemirror_model.Slice(prosemirror_model.Fragment.from(schema.text(op.insert, marks)), 0, 0));
+		currPos.i += op.insert.length;
+	} else if (lib0_delta.$deleteOp.check(op)) {
+		let remaining = op.delete;
+		while (remaining > 0) {
+			const pc = pchildren[currParentIndex];
+			if (!pc) throw new Error("[pm-diff] delete out of bounds");
+			if (pc.isText) {
+				const delLen = Math.min(pc.nodeSize - nOffset, remaining);
+				tr.replace(currPos.i, currPos.i + delLen, prosemirror_model.Slice.empty);
+				nOffset += delLen;
+				if (nOffset === pc.nodeSize) {
+					nOffset = 0;
+					currParentIndex++;
+				}
+				remaining -= delLen;
+			} else {
+				tr.replace(currPos.i, currPos.i + pc.nodeSize, prosemirror_model.Slice.empty);
+				currParentIndex++;
+				remaining--;
+			}
+		}
+	}
+	return tr;
+}
+function deltaToPNode(d, schema, dformat) {
+	const attrs = {};
+	for (const [k, v] of Object.entries(d.attrs ?? {})) attrs[k] = v;
+	const children = Array.from(d.children ?? []).flatMap((op) => {
+		if (lib0_delta.$insertOp.check(op)) return op.insert.map((c) => deltaToPNode(c, schema, op.format));
+		if (lib0_delta.$textOp.check(op)) return [schema.text(op.insert, formatToMarks(op.format, schema))];
+		return [];
+	});
+	const nodeType = schema.nodes[d.name ?? "doc"];
+	if (!nodeType) throw new Error(`[pm-diff] unknown node type: ${d.name}`);
+	const node = nodeType.createAndFill(attrs, children, formatToMarks(dformat, schema));
+	if (!node) throw new Error(`[pm-diff] createAndFill failed for: ${d.name}`);
+	return node;
+}
+/**
+* Compute the minimal diff between two PM docs and apply it as real PM steps.
+* Returns the transaction with the steps applied, or null if docs are identical.
+*/
+function diffPmDocs(tr, oldDoc, newDoc) {
+	const oldDelta = nodeToDelta(oldDoc);
+	const newDelta = nodeToDelta(newDoc);
+	const diff = lib0_delta.diff(oldDelta, newDelta);
+	let hasChanges = false;
+	for (const op of diff.children) if (!lib0_delta.$retainOp.check(op)) {
+		hasChanges = true;
+		break;
+	}
+	if (!hasChanges) return null;
+	return deltaToPSteps(tr, diff);
+}
+
+//#endregion
 exports.ATTRIBUTES_KEY = ATTRIBUTES_KEY;
 exports.CHILDREN_KEY = CHILDREN_KEY;
 exports.CursorAwareness = CursorAwareness;
@@ -1890,6 +2073,8 @@ exports.createConsoleLogger = createConsoleLogger;
 exports.createNodeFromLoroObj = createNodeFromLoroObj;
 exports.cursorToAbsolutePosition = cursorToAbsolutePosition;
 exports.defaultLogger = defaultLogger;
+exports.deltaToPSteps = deltaToPSteps;
+exports.diffPmDocs = diffPmDocs;
 exports.findContainerLocation = findContainerLocation;
 exports.findEmptyTextPosition = findEmptyTextPosition;
 exports.getLoroSyncMeta = getLoroSyncMeta;
@@ -1897,6 +2082,7 @@ exports.isLoroInternalTransaction = isLoroInternalTransaction;
 exports.loroEventBatchToTransaction = loroEventBatchToTransaction;
 exports.loroSyncPluginKey = loroSyncPluginKey;
 exports.loroUndoPluginKey = loroUndoPluginKey;
+exports.nodeToDelta = nodeToDelta;
 exports.redo = redo;
 exports.silentLogger = silentLogger;
 exports.undo = undo;

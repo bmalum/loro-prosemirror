@@ -487,6 +487,7 @@ function tryIncrementalSync(
   }
 }
 
+
 /**
  * Walk the actual PM doc and update mapping entries to point to the real
  * post-dispatch nodes. Uses WEAK_NODE_TO_LORO_CONTAINER_MAPPING as the
@@ -561,8 +562,7 @@ function fullReplaceFallback(
     return;
   }
 
-  // Capture Loro stable cursors BEFORE the replace so we can restore them
-  // synchronously in appendTransaction — no setTimeout/queueMicrotask race.
+  // Capture Loro stable cursors BEFORE the replace so we can restore them.
   const captureCursor = event.by !== "checkout";
   let anchor: Cursor | undefined;
   let focus: Cursor | undefined;
@@ -579,6 +579,9 @@ function fullReplaceFallback(
   }
 
   // Full document replace — always correct, guaranteed to match Loro state.
+  // TODO: replace with diffPmDocs once the mapping rebuild is solved.
+  // diffPmDocs produces real PM steps (no full replace) so PM's native
+  // selection mapping handles cursor preservation automatically.
   const tr = view.state.tr.replace(
     0,
     view.state.doc.content.size,
@@ -597,8 +600,6 @@ function fullReplaceFallback(
   rebuildMappingFromDoc(mapping, view.state.doc);
 
   // Restore cursor using Loro stable cursors via queueMicrotask.
-  // Microtasks run before the browser processes new input events, so this
-  // doesn't race with user keystrokes (unlike setTimeout(0)).
   if (anchor != null && !state.disableFallbackCursorRestore) {
     queueMicrotask(() => {
       syncCursorsToPmSelection(view, anchor!, focus);

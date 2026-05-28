@@ -1,7 +1,10 @@
 import { Awareness, ContainerID, Cursor, EphemeralStore, LoroDoc, LoroEventBatch, LoroList, LoroMap, LoroText, LoroTree, PeerID, Subscription, UndoManager, Value } from "loro-crdt";
-import { Command, EditorState, Plugin as Plugin$1, Selection, Transaction } from "prosemirror-state";
+import * as prosemirror_state0 from "prosemirror-state";
+import { Command, EditorState, Plugin, PluginKey, Selection, Transaction } from "prosemirror-state";
+import * as prosemirror_view0 from "prosemirror-view";
 import { DecorationAttrs, EditorView } from "prosemirror-view";
 import { Node, Schema } from "prosemirror-model";
+import * as delta from "lib0/delta";
 
 //#region src/lib.d.ts
 type LoroChildrenListType = LoroList<LoroMap<LoroNodeContainerType> | LoroText>;
@@ -92,7 +95,7 @@ declare const silentLogger: LoroLogger;
 declare const defaultLogger: LoroLogger;
 //#endregion
 //#region src/sync-plugin-key.d.ts
-declare const loroSyncPluginKey: any;
+declare const loroSyncPluginKey: PluginKey<LoroSyncPluginState>;
 /**
  * Stable string constants for the meta values the plugin attaches to
  * its own transactions. Consumers should pattern-match against these
@@ -265,7 +268,7 @@ interface LoroSyncPluginState extends LoroSyncPluginProps {
 }
 //#endregion
 //#region src/sync-plugin.d.ts
-declare const LoroSyncPlugin: (props: LoroSyncPluginProps) => Plugin$1;
+declare const LoroSyncPlugin: (props: LoroSyncPluginProps) => Plugin;
 //#endregion
 //#region src/incremental-sync.d.ts
 /**
@@ -379,7 +382,7 @@ declare class CursorEphemeralStore extends EphemeralStore<CursorEphemeralStateMa
   getAll(): { [peer in PeerID]: CursorPresenceState };
   subscribeBy(listener: (by: "local" | "import" | "timeout") => void): () => void;
 }
-declare const LoroEphemeralCursorPlugin: (store: CursorEphemeralStore, options: CursorPluginOptions) => Plugin<DecorationSet>;
+declare const LoroEphemeralCursorPlugin: (store: CursorEphemeralStore, options: CursorPluginOptions) => prosemirror_state0.Plugin<prosemirror_view0.DecorationSet>;
 //#endregion
 //#region src/cursor/awareness.d.ts
 declare class CursorAwareness extends Awareness<{
@@ -412,10 +415,10 @@ declare class CursorAwareness extends Awareness<{
     } | null;
   } | undefined;
 }
-declare const LoroCursorPlugin: (awareness: CursorAwareness, options: CursorPluginOptions) => Plugin<DecorationSet>;
+declare const LoroCursorPlugin: (awareness: CursorAwareness, options: CursorPluginOptions) => prosemirror_state0.Plugin<prosemirror_view0.DecorationSet>;
 //#endregion
 //#region src/undo-plugin-key.d.ts
-declare const loroUndoPluginKey: any;
+declare const loroUndoPluginKey: PluginKey<LoroUndoPluginState>;
 interface LoroUndoPluginProps {
   doc: LoroDoc;
   undoManager?: UndoManager;
@@ -425,13 +428,59 @@ interface LoroUndoPluginProps {
    */
   logger?: LoroLogger;
 }
+interface LoroUndoPluginState {
+  undoManager: UndoManager;
+  canUndo: boolean;
+  canRedo: boolean;
+  /**
+   * Re-entrancy guard set by `undo()` / `redo()` while
+   * `UndoManager.undo()` / `.redo()` are in flight. The flag is read by
+   * the sync plugin's `apply` for the `doc-changed` branch so the
+   * plugin doesn't echo the undo's PM transaction back into Loro. The
+   * `appendTransaction` skip-on-internal-meta guard already prevents
+   * the echo for typical batches; this flag is the belt-and-braces for
+   * stacking undo/redo with a custom command pipeline.
+   */
+  isUndoing: {
+    current: boolean;
+  };
+  /**
+   * Selection captured BEFORE the last user transaction was applied.
+   * Used by the `UndoManager.setOnPush` callback to remember where the
+   * cursor was before the edit, so an `undo()` lands the cursor back
+   * at that position. `null` until the first user transaction.
+   */
+  prevSelection: {
+    anchor: Cursor | null;
+    focus: Cursor | null;
+  } | null;
+}
 //#endregion
 //#region src/undo-plugin.d.ts
-declare const LoroUndoPlugin: (props: LoroUndoPluginProps) => Plugin$1;
+declare const LoroUndoPlugin: (props: LoroUndoPluginProps) => Plugin;
 declare function canUndo(state: EditorState): boolean;
 declare function canRedo(state: EditorState): boolean;
 declare const undo: Command;
 declare const redo: Command;
 //#endregion
-export { ATTRIBUTES_KEY, CHILDREN_KEY, type ContainerLocation, CursorAwareness, CursorEphemeralStore, type CursorPluginOptions, type CursorPresenceState, type CursorUser, LORO_SYNC_META, type LoroChildrenListType, type LoroContainer, LoroCursorPlugin, type LoroDocType, LoroEphemeralCursorPlugin, type LoroLogLevel, type LoroLogger, type LoroNode, type LoroNodeContainerType, type LoroNodeMapping, type LoroSyncEvent, type LoroSyncMetaType, LoroSyncPlugin, type LoroSyncPluginProps, type LoroSyncPluginState, type LoroSyncTransactionMeta, type LoroType, LoroUndoPlugin, type LoroUndoPluginProps, NODE_NAME_KEY, ROOT_DOC_KEY, absolutePositionToCursor, canRedo, canUndo, convertPmSelectionToCursors, createConsoleLogger, createNodeFromLoroObj, cursorToAbsolutePosition, defaultLogger, findContainerLocation, findEmptyTextPosition, getLoroSyncMeta, isLoroInternalTransaction, loroEventBatchToTransaction, loroSyncPluginKey, loroUndoPluginKey, redo, silentLogger, undo, updateLoroToPmState };
+//#region src/pm-diff.d.ts
+/**
+ * Convert a ProseMirror node to a lib0 delta.
+ * Text nodes → text ops. Block nodes → insert ops with nested delta.
+ */
+declare function nodeToDelta(node: Node): delta.DeltaAny;
+/**
+ * Apply a lib0 delta diff as real ProseMirror steps on the transaction.
+ * Adapted from y-prosemirror's deltaToPSteps.
+ */
+declare function deltaToPSteps(tr: Transaction, d: delta.DeltaAny, pnode?: Node, currPos?: {
+  i: number;
+}): Transaction;
+/**
+ * Compute the minimal diff between two PM docs and apply it as real PM steps.
+ * Returns the transaction with the steps applied, or null if docs are identical.
+ */
+declare function diffPmDocs(tr: Transaction, oldDoc: Node, newDoc: Node): Transaction | null;
+//#endregion
+export { ATTRIBUTES_KEY, CHILDREN_KEY, type ContainerLocation, CursorAwareness, CursorEphemeralStore, type CursorPluginOptions, type CursorPresenceState, type CursorUser, LORO_SYNC_META, type LoroChildrenListType, type LoroContainer, LoroCursorPlugin, type LoroDocType, LoroEphemeralCursorPlugin, type LoroLogLevel, type LoroLogger, type LoroNode, type LoroNodeContainerType, type LoroNodeMapping, type LoroSyncEvent, type LoroSyncMetaType, LoroSyncPlugin, type LoroSyncPluginProps, type LoroSyncPluginState, type LoroSyncTransactionMeta, type LoroType, LoroUndoPlugin, type LoroUndoPluginProps, NODE_NAME_KEY, ROOT_DOC_KEY, absolutePositionToCursor, canRedo, canUndo, convertPmSelectionToCursors, createConsoleLogger, createNodeFromLoroObj, cursorToAbsolutePosition, defaultLogger, deltaToPSteps, diffPmDocs, findContainerLocation, findEmptyTextPosition, getLoroSyncMeta, isLoroInternalTransaction, loroEventBatchToTransaction, loroSyncPluginKey, loroUndoPluginKey, nodeToDelta, redo, silentLogger, undo, updateLoroToPmState };
 //# sourceMappingURL=index.d.cts.map
