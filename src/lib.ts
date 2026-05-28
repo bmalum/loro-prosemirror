@@ -138,6 +138,12 @@ export function createNodeFromLoroObj(
   if (obj instanceof LoroMap) {
     const attributes = getLoroMapAttributes(obj);
     const children = getLoroMapChildren(obj);
+    // If attributes or children containers don't exist yet, this block
+    // hasn't been fully initialised — skip rather than creating containers
+    // (which would generate local ops that diverge from the server's state).
+    if (attributes == null || children == null) {
+      return null;
+    }
 
     const nodeName = obj.get("nodeName");
     if (nodeName == null || typeof nodeName !== "string") {
@@ -537,6 +543,18 @@ export function getLoroMapAttributes(
   obj: LoroMap,
 ): LoroMap<{ [key: string]: string }> {
   return obj.getOrCreateContainer(ATTRIBUTES_KEY, new LoroMap());
+}
+
+/** Read-only: returns existing container or null, never creates. */
+export function getLoroMapAttributesRO(
+  obj: LoroMap,
+): LoroMap<{ [key: string]: string }> | null {
+  return (obj.get(ATTRIBUTES_KEY) as LoroMap<{ [key: string]: string }>) ?? null;
+}
+
+/** Read-only: returns existing container or null, never creates. */
+export function getLoroMapChildrenRO(obj: LoroNode): LoroChildrenListType | null {
+  return (obj.get(CHILDREN_KEY) as LoroChildrenListType) ?? null;
 }
 
 export function updateLoroMapAttributes(

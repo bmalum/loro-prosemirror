@@ -105,8 +105,6 @@ function findContainerLocationUncached(
       for (let i = 0; i < node.childCount; i++) {
         const child = node.child(i);
         if (child === firstText) {
-          // pos = position of `node`; pos + 1 = inside opening token;
-          // + offset accounts for siblings that precede the text run.
           runStart = pos + 1 + offset;
           return false;
         }
@@ -115,6 +113,7 @@ function findContainerLocationUncached(
       return true;
     });
     if (runStart == null) {
+      console.warn("[loro-pm] findContainerLocation: text node not found in doc", { containerId, mappedLength: mapped.length });
       return null;
     }
     return { node: mapped, pos: runStart, isText: true };
@@ -135,6 +134,26 @@ function findContainerLocationUncached(
     }
     return true;
   });
+  if (foundPos == null) {
+    // The mapped node is not in the doc by object identity, and
+    // WEAK_NODE_TO_LORO_CONTAINER_MAPPING didn't find it either.
+    // This can happen when another plugin creates a new node object
+    // (e.g. via setNodeMarkup) after the fallback dispatch.
+    // As a last resort, find the node by walking the mapping entries
+    // and checking which doc node has the same ContainerID via the
+    // reverse WeakMap.
+    doc.descendants((node, pos) => {
+      if (foundPos != null) return false;
+      const cid = WEAK_NODE_TO_LORO_CONTAINER_MAPPING.get(node);
+      if (cid === containerId) {
+        foundPos = pos;
+        // Update the mapping to point to the current node
+        mapping.set(containerId, node);
+        return false;
+      }
+      return true;
+    });
+  }
   if (foundPos == null) {
     return null;
   }

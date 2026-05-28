@@ -37,6 +37,11 @@ export type {
   CursorUser,
 } from "./cursor/common";
 export {
+  absolutePositionToCursor,
+  cursorToAbsolutePosition,
+  convertPmSelectionToCursors,
+} from "./cursor/common";
+export {
   CursorEphemeralStore,
   LoroEphemeralCursorPlugin,
 } from "./cursor/ephemeral";

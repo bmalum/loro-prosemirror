@@ -39,6 +39,7 @@ function createNodeFromLoroObj(schema, obj, mapping, onError) {
 	if (obj instanceof loro_crdt.LoroMap) {
 		const attributes = getLoroMapAttributes(obj);
 		const children = getLoroMapChildren(obj);
+		if (attributes == null || children == null) return null;
 		const nodeName = obj.get("nodeName");
 		if (nodeName == null || typeof nodeName !== "string") {
 			const err = /* @__PURE__ */ new Error("Invalid nodeName");
@@ -707,7 +708,13 @@ function findContainerLocationUncached(doc, containerId, mapping) {
 			}
 			return true;
 		});
-		if (runStart == null) return null;
+		if (runStart == null) {
+			console.warn("[loro-pm] findContainerLocation: text node not found in doc", {
+				containerId,
+				mappedLength: mapped.length
+			});
+			return null;
+		}
 		return {
 			node: mapped,
 			pos: runStart,
@@ -724,6 +731,15 @@ function findContainerLocationUncached(doc, containerId, mapping) {
 		if (foundPos != null) return false;
 		if (node === mapped) {
 			foundPos = pos;
+			return false;
+		}
+		return true;
+	});
+	if (foundPos == null) doc.descendants((node, pos) => {
+		if (foundPos != null) return false;
+		if (WEAK_NODE_TO_LORO_CONTAINER_MAPPING.get(node) === containerId) {
+			foundPos = pos;
+			mapping.set(containerId, node);
 			return false;
 		}
 		return true;
@@ -1362,6 +1378,7 @@ function bootstrapDispatch(view, state, docSubscription) {
 	});
 	tr.setMeta("addToHistory", false);
 	view.dispatch(tr);
+	fixRootMapping(state, mapping, view);
 	emitSyncEvent(state, {
 		kind: "init",
 		mode: "loro-populated"
@@ -1467,6 +1484,32 @@ function tryIncrementalSync(view, event, state) {
 	}
 }
 /**
+* Walk the actual PM doc and update mapping entries to point to the real
+* post-dispatch nodes. Uses WEAK_NODE_TO_LORO_CONTAINER_MAPPING as the
+* reverse index (ContainerID is stored on each node by createNodeFromLoroObj).
+* This corrects stale entries that arise when PM creates new node objects
+* (e.g. via setNodeMarkup from other plugins) after a full-replace dispatch.
+*/
+function rebuildMappingFromDoc(mapping, doc) {
+	doc.descendants((node) => {
+		const cid = WEAK_NODE_TO_LORO_CONTAINER_MAPPING.get(node);
+		if (cid != null) mapping.set(cid, node);
+		return true;
+	});
+}
+/**
+* After a full-replace dispatch, the mapping entry for the root Loro container
+* points to the pre-dispatch PM doc node (created by createNodeFromLoroObj).
+* ProseMirror's tr.replace creates a new doc node, so `mapped === view.state.doc`
+* fails in findContainerLocation, causing every subsequent incremental sync to
+* return null (cascade fallback). Fix by updating the root entry to the actual
+* post-dispatch doc node.
+*/
+function fixRootMapping(state, mapping, view) {
+	const innerDoc = state.containerId ? state.doc.getContainerById(state.containerId) : state.doc.getMap(ROOT_DOC_KEY);
+	if (innerDoc != null) mapping.set(innerDoc.id, view.state.doc);
+}
+/**
 * Legacy full-document rebuild. Kept as the safety net for events that the
 * incremental translator cannot (yet) handle — it is the historical behaviour
 * of this plugin and is guaranteed to leave the PM doc in a state that
@@ -1495,13 +1538,7 @@ function fullReplaceFallback(view, event, state) {
 		const encoded = convertPmSelectionToCursors(view.state.doc, view.state.selection, state);
 		anchor = encoded.anchor;
 		focus = encoded.focus;
-	} catch (e) {
-		emitSyncEvent(state, {
-			kind: "error",
-			phase: "cursor-encode",
-			error: e
-		});
-	}
+	} catch (_) {}
 	const tr = view.state.tr.replace(0, view.state.doc.content.size, new prosemirror_model.Slice(prosemirror_model.Fragment.from(node), 0, 0));
 	tr.setMeta(loroSyncPluginKey, {
 		type: "non-local-updates",
@@ -1509,9 +1546,9 @@ function fullReplaceFallback(view, event, state) {
 	});
 	tr.setMeta("addToHistory", false);
 	view.dispatch(tr);
-	if (anchor == null) return;
-	if (state.disableFallbackCursorRestore) return;
-	queueMicrotask(() => {
+	fixRootMapping(state, mapping, view);
+	rebuildMappingFromDoc(mapping, view.state.doc);
+	if (anchor != null && !state.disableFallbackCursorRestore) queueMicrotask(() => {
 		syncCursorsToPmSelection(view, anchor, focus);
 	});
 }
@@ -1845,10 +1882,13 @@ exports.LoroSyncPlugin = LoroSyncPlugin;
 exports.LoroUndoPlugin = LoroUndoPlugin;
 exports.NODE_NAME_KEY = NODE_NAME_KEY;
 exports.ROOT_DOC_KEY = ROOT_DOC_KEY;
+exports.absolutePositionToCursor = absolutePositionToCursor;
 exports.canRedo = canRedo;
 exports.canUndo = canUndo;
+exports.convertPmSelectionToCursors = convertPmSelectionToCursors;
 exports.createConsoleLogger = createConsoleLogger;
 exports.createNodeFromLoroObj = createNodeFromLoroObj;
+exports.cursorToAbsolutePosition = cursorToAbsolutePosition;
 exports.defaultLogger = defaultLogger;
 exports.findContainerLocation = findContainerLocation;
 exports.findEmptyTextPosition = findEmptyTextPosition;

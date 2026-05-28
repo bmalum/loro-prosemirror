@@ -329,7 +329,7 @@ function getByValue(map: Map<ContainerID, Node | Node[]>, searchValue: Node) {
   return undefined;
 }
 
-function absolutePositionToCursor(
+export function absolutePositionToCursor(
   pmRootNode: Node,
   anchor: number,
   doc: LoroDocType,

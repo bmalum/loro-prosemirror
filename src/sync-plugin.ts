@@ -17,6 +17,7 @@ import {
   ROOT_DOC_KEY,
   safeSetSelection,
   updateLoroToPmState,
+  WEAK_NODE_TO_LORO_CONTAINER_MAPPING,
 } from "./lib";
 import {
   loroSyncPluginKey,
@@ -143,10 +144,6 @@ export const LoroSyncPlugin = (props: LoroSyncPluginProps): Plugin => {
       },
     } as StateField<LoroSyncPluginState>,
     appendTransaction: (transactions, _oldEditorState, newEditorState) => {
-      // Only echo PM->Loro for transactions that are user/host edits, not
-      // the plugin's own non-local-updates / update-state transactions.
-      // Otherwise an upstream Loro event triggers a PM dispatch that we'd
-      // immediately re-export to Loro (echo loop).
       const isInternal = transactions.some(
         (tr) => tr.getMeta(loroSyncPluginKey) != null,
       );
@@ -345,6 +342,11 @@ function bootstrapDispatch(
   });
   tr.setMeta("addToHistory", false);
   view.dispatch(tr);
+  // After dispatch, view.state.doc is the actual PM doc node. The mapping
+  // entry for the root container was set to the pre-dispatch doc node by
+  // createNodeFromLoroObj. Update it to point to the actual doc node so
+  // findContainerLocation's `mapped === doc` check works correctly.
+  fixRootMapping(state, mapping, view);
   emitSyncEvent(state, { kind: "init", mode: "loro-populated" });
 }
 
@@ -486,6 +488,47 @@ function tryIncrementalSync(
 }
 
 /**
+ * Walk the actual PM doc and update mapping entries to point to the real
+ * post-dispatch nodes. Uses WEAK_NODE_TO_LORO_CONTAINER_MAPPING as the
+ * reverse index (ContainerID is stored on each node by createNodeFromLoroObj).
+ * This corrects stale entries that arise when PM creates new node objects
+ * (e.g. via setNodeMarkup from other plugins) after a full-replace dispatch.
+ */
+function rebuildMappingFromDoc(
+  mapping: LoroNodeMapping,
+  doc: import("prosemirror-model").Node,
+): void {
+  doc.descendants((node) => {
+    const cid = WEAK_NODE_TO_LORO_CONTAINER_MAPPING.get(node);
+    if (cid != null) {
+      mapping.set(cid, node);
+    }
+    return true;
+  });
+}
+
+/**
+ * After a full-replace dispatch, the mapping entry for the root Loro container
+ * points to the pre-dispatch PM doc node (created by createNodeFromLoroObj).
+ * ProseMirror's tr.replace creates a new doc node, so `mapped === view.state.doc`
+ * fails in findContainerLocation, causing every subsequent incremental sync to
+ * return null (cascade fallback). Fix by updating the root entry to the actual
+ * post-dispatch doc node.
+ */
+function fixRootMapping(
+  state: LoroSyncPluginState,
+  mapping: LoroNodeMapping,
+  view: EditorView,
+): void {
+  const innerDoc = state.containerId
+    ? (state.doc.getContainerById(state.containerId) as LoroMap<LoroNodeContainerType>)
+    : (state.doc as LoroDocType).getMap(ROOT_DOC_KEY);
+  if (innerDoc != null) {
+    mapping.set(innerDoc.id, view.state.doc);
+  }
+}
+
+/**
  * Legacy full-document rebuild. Kept as the safety net for events that the
  * incremental translator cannot (yet) handle — it is the historical behaviour
  * of this plugin and is guaranteed to leave the PM doc in a state that
@@ -518,12 +561,8 @@ function fullReplaceFallback(
     return;
   }
 
-  // Only capture the local cursor when there's a meaningful chance we
-  // can re-anchor it after the rebuild. For `checkout` batches the user
-  // is intentionally jumping to a different document version — the local
-  // cursor is no longer semantically valid, so we leave PM's natural
-  // selection mapping to handle the position. Consumers using checkout
-  // typically manage their own cursor placement.
+  // Capture Loro stable cursors BEFORE the replace so we can restore them
+  // synchronously in appendTransaction — no setTimeout/queueMicrotask race.
   const captureCursor = event.by !== "checkout";
   let anchor: Cursor | undefined;
   let focus: Cursor | undefined;
@@ -536,11 +575,10 @@ function fullReplaceFallback(
       );
       anchor = encoded.anchor;
       focus = encoded.focus;
-    } catch (e) {
-      emitSyncEvent(state, { kind: "error", phase: "cursor-encode", error: e });
-    }
+    } catch (_) { /* ignore */ }
   }
 
+  // Full document replace — always correct, guaranteed to match Loro state.
   const tr = view.state.tr.replace(
     0,
     view.state.doc.content.size,
@@ -554,24 +592,18 @@ function fullReplaceFallback(
   tr.setMeta("addToHistory", false);
   view.dispatch(tr);
 
-  if (anchor == null) {
-    return;
+  // Fix mapping after dispatch so subsequent incremental syncs can find nodes.
+  fixRootMapping(state, mapping, view);
+  rebuildMappingFromDoc(mapping, view.state.doc);
+
+  // Restore cursor using Loro stable cursors via queueMicrotask.
+  // Microtasks run before the browser processes new input events, so this
+  // doesn't race with user keystrokes (unlike setTimeout(0)).
+  if (anchor != null && !state.disableFallbackCursorRestore) {
+    queueMicrotask(() => {
+      syncCursorsToPmSelection(view, anchor!, focus);
+    });
   }
-  if (state.disableFallbackCursorRestore) {
-    // Host has its own cursor-restore mechanism (typically an
-    // `appendTransaction` that detects `LORO_SYNC_META.NON_LOCAL_UPDATES`
-    // and re-sets the selection synchronously during the same tx
-    // batch). Running our microtask afterwards would override the
-    // host's chosen position with our Loro-cursor round-trip, which
-    // can be slightly less accurate.
-    return;
-  }
-  // Defer with queueMicrotask (instead of setTimeout) so the selection
-  // restore runs at the next microtask checkpoint — same task, so any
-  // synchronous follow-up still observes the correct cursor.
-  queueMicrotask(() => {
-    syncCursorsToPmSelection(view, anchor!, focus);
-  });
 }
 
 /**
