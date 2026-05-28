@@ -567,18 +567,26 @@ export function updateLoroMapAttributes(
 
   const pAttrs = node.attrs;
   for (const [key, value] of Object.entries(pAttrs)) {
-    if (value !== null) {
-      if (!equalityDeep(attrs.get(key), value)) {
-        attrs.set(key, value);
-      }
-    } else {
-      attrs.delete(key);
+    // Skip host-specific attrs that should not be stored in the CRDT.
+    // `id` is set by the host's BlockIdExtension and is per-client —
+    // writing it to Loro creates a feedback loop of map-diff fallbacks.
+    if (key === "id") continue;
+    // Skip null/default attrs — they don't need to be in the CRDT and
+    // writing them creates unnecessary map diffs that cause fallbacks.
+    if (value === null) {
+      if (attrs.get(key) !== undefined) attrs.delete(key);
+      keys.delete(key);
+      continue;
+    }
+    if (!equalityDeep(attrs.get(key), value)) {
+      attrs.set(key, value);
     }
     keys.delete(key);
   }
 
-  // remove all keys that are no longer in pAttrs
+  // remove all keys that are no longer in pAttrs (except id)
   for (const key of keys) {
+    if (key === "id") continue;
     attrs.delete(key);
   }
 }
@@ -618,7 +626,17 @@ export function updateLoroMapChildren(
         // We need to refresh all the mappings under this node
         if (!Array.isArray(leftNode)) {
           updateLoroMap(leftLoro as LoroNode, leftNode as Node, mapping);
+        } else {
+          // leftNode is an array of text nodes — only update the mapping,
+          // do NOT write to Loro (that would create duplicate ops if the
+          // text came from a remote update).
+          mapping.set(leftLoro.id, leftNode);
         }
+      } else if (leftLoro instanceof LoroText && Array.isArray(leftNode)) {
+        // LoroText content differs from PM text — only update the mapping.
+        // The actual Loro write will happen via the normal doc-changed path
+        // when the user makes a local edit.
+        mapping.set(leftLoro.id, leftNode);
       } else {
         break;
       }
@@ -641,6 +659,8 @@ export function updateLoroMapChildren(
         // We need to refresh all the mappings under this node
         if (!Array.isArray(rightNode)) {
           updateLoroMap(rightLoro as LoroNode, rightNode as Node, mapping);
+        } else {
+          mapping.set(rightLoro.id, rightNode);
         }
       } else {
         break;

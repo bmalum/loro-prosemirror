@@ -310,12 +310,10 @@ function walkLoroAndPm(
   const pmChildren = pmNode.content.content;
   const loroLen = loroList.length;
   let pmIdx = 0;
-  console.debug("[pm-diff] walkLoroAndPm", { loroLen, pmChildCount: pmChildren.length });
   for (let i = 0; i < loroLen && pmIdx < pmChildren.length; i++) {
     const loroChild = loroList.get(i);
     if (!loroChild) continue;
     const cid = (loroChild as any)?.id ?? "unknown";
-    console.debug("[pm-diff] loroChild", { cid, isText: isLoroText(loroChild), isMap: isLoroMap(loroChild) });
     if (isLoroText(loroChild)) {
       // LoroText → collect consecutive PM text nodes
       const textNodes: Node[] = [];
@@ -333,6 +331,7 @@ function walkLoroAndPm(
       if (!pmChild) break;
       mapping.set(loroChild.id, pmChild);
       WEAK_NODE_TO_LORO_CONTAINER_MAPPING.set(pmChild, loroChild.id);
+      console.debug("[walkLoroAndPm] set", { cid: loroChild.id, pmChildType: pmChild.type.name, weakMapSet: WEAK_NODE_TO_LORO_CONTAINER_MAPPING.get(pmChild) === loroChild.id });
       const childList = loroChild.get(CHILDREN_KEY) as LoroList | undefined;
       if (childList) walkLoroAndPm(childList, pmChild, mapping);
     }

@@ -542,7 +542,11 @@ function fullReplaceFallback(
   state: LoroSyncPluginState,
 ) {
   const mapping = state.mapping;
-  clearChangedNodes(state.doc as LoroDocType, event, mapping);
+  // Use a FRESH mapping for createNodeFromLoroObj so it doesn't pollute
+  // the original mapping with stale nodes. The original mapping will be
+  // rebuilt correctly by rebuildMappingAfterDiff after the dispatch.
+  const freshMapping: LoroNodeMapping = new Map();
+  clearChangedNodes(state.doc as LoroDocType, event, freshMapping);
   const node = createNodeFromLoroObj(
     view.state.schema,
     state.containerId
@@ -550,7 +554,7 @@ function fullReplaceFallback(
           state.containerId,
         ) as LoroMap<LoroNodeContainerType>)
       : (state.doc as LoroDocType).getMap(ROOT_DOC_KEY),
-    mapping,
+    freshMapping,
     (e) =>
       emitSyncEvent(state, { kind: "error", phase: "materialize", error: e }),
   );
@@ -621,6 +625,7 @@ function fullReplaceFallback(
     mapping,
     state.containerId,
   );
+
   // For full replace fallback, also restore cursor via Loro stable cursors.
   if (usedFullReplace && anchor != null && !state.disableFallbackCursorRestore) {
     queueMicrotask(() => {

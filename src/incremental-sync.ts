@@ -64,6 +64,7 @@ export function findContainerLocation(
   containerId: ContainerID,
   mapping: LoroNodeMapping,
   cache?: Map<ContainerID, ContainerLocation | null>,
+  loroDoc?: LoroDocType,
 ): ContainerLocation | null {
   if (doc == null || containerId == null || mapping == null) {
     return null;
@@ -74,7 +75,7 @@ export function findContainerLocation(
       return cached;
     }
   }
-  const result = findContainerLocationUncached(doc, containerId, mapping);
+  const result = findContainerLocationUncached(doc, containerId, mapping, loroDoc);
   if (cache != null) {
     cache.set(containerId, result);
   }
@@ -85,6 +86,7 @@ function findContainerLocationUncached(
   doc: Node,
   containerId: ContainerID,
   mapping: LoroNodeMapping,
+  loroDoc?: LoroDocType,
 ): ContainerLocation | null {
   const mapped = mapping.get(containerId);
   if (mapped == null) {
@@ -113,7 +115,6 @@ function findContainerLocationUncached(
       return true;
     });
     if (runStart == null) {
-      console.warn("[loro-pm] findContainerLocation: text node not found in doc", { containerId, mappedLength: mapped.length });
       return null;
     }
     return { node: mapped, pos: runStart, isText: true };
@@ -155,10 +156,119 @@ function findContainerLocationUncached(
     });
   }
   if (foundPos == null) {
+    // The mapped node is not in the doc by object identity, and
+    // WEAK_NODE_TO_LORO_CONTAINER_MAPPING didn't find it either.
+    // As a last resort, if we have the Loro doc, compute the position
+    // from the Loro tree structure.
+    if (loroDoc != null) {
+      const container = loroDoc.getContainerById(containerId);
+      if (container instanceof LoroMap) {
+        const pos = computeBlockPosFromLoro(
+          container as LoroMap<LoroNodeContainerType>,
+          doc,
+          loroDoc,
+          mapping,
+        );
+        if (pos != null) {
+          foundPos = pos;
+          try {
+            const actualNode = doc.nodeAt(pos);
+            if (actualNode) {
+              mapping.set(containerId, actualNode);
+              WEAK_NODE_TO_LORO_CONTAINER_MAPPING.set(actualNode, containerId);
+            }
+          } catch (_) { /* ignore */ }
+        }
+      }
+    }
+  }
+  if (foundPos == null) {
     return null;
   }
   return { node: mapped, pos: foundPos, isText: false };
 }
+
+/**
+ * Compute the PM position of a block-level Loro container by walking the
+ * Loro tree structure. This is a fallback for when the mapping has a stale
+ * node reference. It sums the sizes of all preceding siblings in the Loro
+ * tree to compute the absolute PM position.
+ *
+ * Returns null if the container cannot be found in the Loro tree.
+ */
+function computeBlockPosFromLoro(
+  blockMap: LoroMap<LoroNodeContainerType>,
+  pmDoc: import("prosemirror-model").Node,
+  loroDoc: LoroDocType,
+  mapping: LoroNodeMapping,
+): number | null {
+  // Find the parent list of this block
+  const parentList = blockMap.parent();
+  if (!(parentList instanceof LoroList)) {
+    return null;
+  }
+  const grandParent = parentList.parent();
+  if (!(grandParent instanceof LoroMap)) {
+    return null;
+  }
+
+  // Find grandParent's position in the PM doc
+  let grandParentPos = 0;
+  const grandParentMapped = mapping.get(grandParent.id);
+  // For the root doc, grandParentMapped might be stale. Check if it's the
+  // actual pmDoc by type, or fall back to position 0 for the root.
+  const isRootDoc = grandParent.id === "cid:root-doc:Map" || grandParent.id.startsWith("cid:root-doc:");
+  if (isRootDoc) {
+    grandParentPos = 0; // root doc is always at position 0
+  } else if (grandParentMapped && !Array.isArray(grandParentMapped)) {
+    let found = false;
+    pmDoc.descendants((node, pos) => {
+      if (found) return false;
+      if (node === grandParentMapped) { grandParentPos = pos + 1; found = true; return false; }
+      return true;
+    });
+    if (!found) {
+      // Try WEAK_NODE_TO_LORO_CONTAINER_MAPPING
+      pmDoc.descendants((node, pos) => {
+        if (found) return false;
+        const cid = WEAK_NODE_TO_LORO_CONTAINER_MAPPING.get(node);
+        if (cid === grandParent.id) { grandParentPos = pos + 1; found = true; return false; }
+        return true;
+      });
+      if (!found) return null;
+    }
+  } else {
+    return null;
+  }
+
+  // Sum sizes of preceding siblings to find blockMap's position
+  let pos = grandParentPos;
+  const listLen = parentList.length;
+  for (let i = 0; i < listLen; i++) {
+    const sibling = parentList.get(i);
+    if (!sibling) continue;
+    if ((sibling as any).id === blockMap.id) {
+      return pos;
+    }
+    const siblingMapped = mapping.get((sibling as any).id);
+    if (siblingMapped && !Array.isArray(siblingMapped)) {
+      pos += (siblingMapped as import("prosemirror-model").Node).nodeSize;
+    } else {
+      let siblingSize = 0;
+      pmDoc.descendants((node) => {
+        const cid = WEAK_NODE_TO_LORO_CONTAINER_MAPPING.get(node);
+        if (cid === (sibling as any).id) { siblingSize = node.nodeSize; return false; }
+        return true;
+      });
+      if (siblingSize === 0) {
+        return null;
+      }
+      pos += siblingSize;
+    }
+  }
+  return null;
+}
+
 
 /**
  * Resolve the PM position of a `LoroText` whose mapping entry is missing
@@ -200,7 +310,7 @@ export function findEmptyTextPosition(
     return null;
   }
 
-  const blockLoc = findContainerLocation(pmDoc, parentBlock.id, mapping);
+  const blockLoc = findContainerLocation(pmDoc, parentBlock.id, mapping, undefined, loroDoc);
   if (blockLoc == null || blockLoc.isText || Array.isArray(blockLoc.node)) {
     return null;
   }
@@ -314,6 +424,7 @@ export function loroEventBatchToTransaction(
   // descendant visits.
   const locationCache = new Map<ContainerID, ContainerLocation | null>();
 
+  const batchId = Math.random().toString(36).slice(2, 6);
   for (const event of batch.events) {
     if (materialisedInBatch.has(event.target)) {
       continue;
@@ -331,6 +442,11 @@ export function loroEventBatchToTransaction(
     );
     if (!ok) {
       return null;
+    }
+    // Check if text container mapping is correct
+    for (const [k, v] of mapping) {
+      if (k.endsWith(":Text") && !Array.isArray(v)) {
+      }
     }
   }
   return tr;
@@ -435,7 +551,7 @@ function applyTextDiff(
   dirtyAncestorBlocks: Set<ContainerID>,
   locationCache: Map<ContainerID, ContainerLocation | null>,
 ): boolean {
-  const loc = findContainerLocation(state.doc, target, mapping, locationCache);
+  const loc = findContainerLocation(tr.doc, target, mapping, locationCache, doc);
   let prePos: number;
   let usedFallback = false;
   if (loc != null && loc.isText) {
@@ -453,7 +569,9 @@ function applyTextDiff(
     if (anyAncestorTouched(text, parentTouchedInBatch)) {
       return false;
     }
-    const fallback = findEmptyTextPosition(state.doc, target, mapping, doc);
+    const fallback = findEmptyTextPosition(tr.doc, target, mapping, doc);
+    if (fallback == null) {
+    }
     if (fallback == null) {
       return false;
     }
@@ -471,6 +589,17 @@ function applyTextDiff(
       // only a positive retain is incompatible with the empty-text
       // fallback path (we'd be walking over characters that don't exist).
       if (usedFallback && op.retain > 0) {
+        // The empty-text fallback was used but the diff has retain ops,
+        // meaning the text container actually has content. This happens
+        // when the mapping has a stale empty entry but the Loro text has
+        // content. Use the Loro text's current length to validate.
+        const loroText = doc.getContainerById(target);
+        if (loroText instanceof LoroText && loroText.length >= op.retain) {
+          // The Loro text has enough content — proceed with the retain.
+          // The cursor position is correct (prePos is the start of the text run).
+          cursor += op.retain;
+          continue;
+        }
         return false;
       }
       if (op.attributes && op.retain > 0) {
@@ -495,7 +624,11 @@ function applyTextDiff(
         return false;
       }
       const textNode = state.schema.text(op.insert, marks);
-      tr.insert(cursor, textNode);
+      try {
+        tr.insert(cursor, textNode);
+      } catch (e) {
+        return false;
+      }
       cursor += op.insert.length;
     } else if (op.delete != null) {
       if (usedFallback) {
@@ -658,10 +791,11 @@ function applyListDiff(
   }
 
   const parentLoc = findContainerLocation(
-    state.doc,
+    tr.doc,
     parentMap.id,
     mapping,
     locationCache,
+    doc,
   );
   if (parentLoc == null || parentLoc.isText) {
     return false;
@@ -1002,6 +1136,7 @@ function applyMapDiff(
     parent.id,
     mapping,
     locationCache,
+    doc,
   );
   if (blockLoc == null || blockLoc.isText || Array.isArray(blockLoc.node)) {
     return false;
@@ -1022,6 +1157,15 @@ function applyMapDiff(
 
   try {
     tr.setNodeMarkup(blockPos, undefined, newAttrs);
+    // Update the mapping to point to the new node (setNodeMarkup creates a new node object)
+    try {
+      const newNode = tr.doc.nodeAt(blockPos);
+      if (newNode) {
+        mapping.set(parent.id, newNode);
+        WEAK_NODE_TO_LORO_CONTAINER_MAPPING.set(newNode, parent.id);
+        locationCache.delete(parent.id); // invalidate so next lookup uses new node
+      }
+    } catch (_) { /* ignore */ }
   } catch {
     return false;
   }

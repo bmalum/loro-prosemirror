@@ -305,7 +305,7 @@ interface ContainerLocation {
  * walk over `doc.descendants` is O(N) per call, so without a cache a
  * batch of M events on a doc of size N is O(N·M).
  */
-declare function findContainerLocation(doc: Node, containerId: ContainerID, mapping: LoroNodeMapping, cache?: Map<ContainerID, ContainerLocation | null>): ContainerLocation | null;
+declare function findContainerLocation(doc: Node, containerId: ContainerID, mapping: LoroNodeMapping, cache?: Map<ContainerID, ContainerLocation | null>, loroDoc?: LoroDocType): ContainerLocation | null;
 /**
  * Resolve the PM position of a `LoroText` whose mapping entry is missing
  * (typically because `updateLoroToPmState` pruned it after the LoroText
