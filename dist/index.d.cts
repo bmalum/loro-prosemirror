@@ -1,3 +1,4 @@
+import * as loro_crdt0 from "loro-crdt";
 import { Awareness, ContainerID, Cursor, EphemeralStore, LoroDoc, LoroEventBatch, LoroList, LoroMap, LoroText, LoroTree, PeerID, Subscription, UndoManager, Value } from "loro-crdt";
 import * as prosemirror_state0 from "prosemirror-state";
 import { Command, EditorState, Plugin, PluginKey, Selection, Transaction } from "prosemirror-state";
@@ -478,9 +479,21 @@ declare function deltaToPSteps(tr: Transaction, d: delta.DeltaAny, pnode?: Node,
 }): Transaction;
 /**
  * Compute the minimal diff between two PM docs and apply it as real PM steps.
+ * Uses the Loro-derived nodes (from createNodeFromLoroObj) for changed blocks,
+ * which ensures WEAK_NODE_TO_LORO_CONTAINER_MAPPING entries are set correctly.
+ *
  * Returns the transaction with the steps applied, or null if docs are identical.
  */
 declare function diffPmDocs(tr: Transaction, oldDoc: Node, newDoc: Node): Transaction | null;
+/**
+ * After diffPmDocs, the new PM doc has nodes created by deltaToPNode which
+ * don't have WEAK_NODE_TO_LORO_CONTAINER_MAPPING entries. This function walks
+ * the Loro doc and the new PM doc in parallel to rebuild the mapping.
+ *
+ * The Loro doc and the new PM doc have the same structure (that's the point
+ * of the diff), so we can walk them together and establish the correspondence.
+ */
+declare function rebuildMappingAfterDiff(loroDoc: LoroDocType, pmDoc: Node, mapping: LoroNodeMapping, containerId?: loro_crdt0.ContainerID): void;
 //#endregion
-export { ATTRIBUTES_KEY, CHILDREN_KEY, type ContainerLocation, CursorAwareness, CursorEphemeralStore, type CursorPluginOptions, type CursorPresenceState, type CursorUser, LORO_SYNC_META, type LoroChildrenListType, type LoroContainer, LoroCursorPlugin, type LoroDocType, LoroEphemeralCursorPlugin, type LoroLogLevel, type LoroLogger, type LoroNode, type LoroNodeContainerType, type LoroNodeMapping, type LoroSyncEvent, type LoroSyncMetaType, LoroSyncPlugin, type LoroSyncPluginProps, type LoroSyncPluginState, type LoroSyncTransactionMeta, type LoroType, LoroUndoPlugin, type LoroUndoPluginProps, NODE_NAME_KEY, ROOT_DOC_KEY, absolutePositionToCursor, canRedo, canUndo, convertPmSelectionToCursors, createConsoleLogger, createNodeFromLoroObj, cursorToAbsolutePosition, defaultLogger, deltaToPSteps, diffPmDocs, findContainerLocation, findEmptyTextPosition, getLoroSyncMeta, isLoroInternalTransaction, loroEventBatchToTransaction, loroSyncPluginKey, loroUndoPluginKey, nodeToDelta, redo, silentLogger, undo, updateLoroToPmState };
+export { ATTRIBUTES_KEY, CHILDREN_KEY, type ContainerLocation, CursorAwareness, CursorEphemeralStore, type CursorPluginOptions, type CursorPresenceState, type CursorUser, LORO_SYNC_META, type LoroChildrenListType, type LoroContainer, LoroCursorPlugin, type LoroDocType, LoroEphemeralCursorPlugin, type LoroLogLevel, type LoroLogger, type LoroNode, type LoroNodeContainerType, type LoroNodeMapping, type LoroSyncEvent, type LoroSyncMetaType, LoroSyncPlugin, type LoroSyncPluginProps, type LoroSyncPluginState, type LoroSyncTransactionMeta, type LoroType, LoroUndoPlugin, type LoroUndoPluginProps, NODE_NAME_KEY, ROOT_DOC_KEY, absolutePositionToCursor, canRedo, canUndo, convertPmSelectionToCursors, createConsoleLogger, createNodeFromLoroObj, cursorToAbsolutePosition, defaultLogger, deltaToPSteps, diffPmDocs, findContainerLocation, findEmptyTextPosition, getLoroSyncMeta, isLoroInternalTransaction, loroEventBatchToTransaction, loroSyncPluginKey, loroUndoPluginKey, nodeToDelta, rebuildMappingAfterDiff, redo, silentLogger, undo, updateLoroToPmState };
 //# sourceMappingURL=index.d.cts.map

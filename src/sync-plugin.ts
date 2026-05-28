@@ -19,6 +19,7 @@ import {
   updateLoroToPmState,
   WEAK_NODE_TO_LORO_CONTAINER_MAPPING,
 } from "./lib";
+import { diffPmDocs, rebuildMappingAfterDiff } from "./pm-diff";
 import {
   loroSyncPluginKey,
   type LoroSyncEvent,
@@ -578,15 +579,31 @@ function fullReplaceFallback(
     } catch (_) { /* ignore */ }
   }
 
-  // Full document replace — always correct, guaranteed to match Loro state.
-  // TODO: replace with diffPmDocs once the mapping rebuild is solved.
-  // diffPmDocs produces real PM steps (no full replace) so PM's native
-  // selection mapping handles cursor preservation automatically.
-  const tr = view.state.tr.replace(
-    0,
-    view.state.doc.content.size,
-    new Slice(Fragment.from(node), 0, 0),
-  );
+  // Use diffPmDocs to apply only the changed parts as real PM steps.
+  // PM's native selection mapping handles cursor preservation automatically.
+  // Fall back to full replace if diffPmDocs throws (schema violations, etc.).
+  let usedFullReplace = false;
+  let tr: import("prosemirror-state").Transaction;
+  try {
+    const result = diffPmDocs(
+      view.state.tr,
+      view.state.doc,
+      node as import("prosemirror-model").Node,
+    );
+    if (result == null) {
+      // Docs are identical — nothing to do.
+      return;
+    }
+    tr = result;
+  } catch (e) {
+    emitSyncEvent(state, { kind: "error", phase: "diff", error: e });
+    tr = view.state.tr.replace(
+      0,
+      view.state.doc.content.size,
+      new Slice(Fragment.from(node), 0, 0),
+    );
+    usedFullReplace = true;
+  }
 
   tr.setMeta(loroSyncPluginKey, {
     type: "non-local-updates",
@@ -595,12 +612,17 @@ function fullReplaceFallback(
   tr.setMeta("addToHistory", false);
   view.dispatch(tr);
 
-  // Fix mapping after dispatch so subsequent incremental syncs can find nodes.
-  fixRootMapping(state, mapping, view);
-  rebuildMappingFromDoc(mapping, view.state.doc);
-
-  // Restore cursor using Loro stable cursors via queueMicrotask.
-  if (anchor != null && !state.disableFallbackCursorRestore) {
+  // Rebuild mapping so subsequent incremental syncs can find nodes.
+  // rebuildMappingAfterDiff walks Loro + PM in parallel, setting
+  // WEAK_NODE_TO_LORO_CONTAINER_MAPPING on the actual PM nodes.
+  rebuildMappingAfterDiff(
+    state.doc as LoroDocType,
+    view.state.doc,
+    mapping,
+    state.containerId,
+  );
+  // For full replace fallback, also restore cursor via Loro stable cursors.
+  if (usedFullReplace && anchor != null && !state.disableFallbackCursorRestore) {
     queueMicrotask(() => {
       syncCursorsToPmSelection(view, anchor!, focus);
     });

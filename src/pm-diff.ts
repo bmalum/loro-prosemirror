@@ -17,6 +17,23 @@
 import * as delta from "lib0/delta";
 import { Fragment, type Node, Slice } from "prosemirror-model";
 import type { Transaction } from "prosemirror-state";
+import type { LoroList, LoroMap, LoroText } from "loro-crdt";
+import { LoroList as LoroListClass, LoroMap as LoroMapClass, LoroText as LoroTextClass } from "loro-crdt";
+import {
+  ATTRIBUTES_KEY,
+  CHILDREN_KEY,
+  type LoroDocType,
+  type LoroNodeContainerType,
+  type LoroNodeMapping,
+  ROOT_DOC_KEY,
+  WEAK_NODE_TO_LORO_CONTAINER_MAPPING,
+} from "./lib";
+
+// Helper: check container type via ID suffix (avoids instanceof issues with WASM classes)
+const isLoroText = (c: unknown): c is LoroText =>
+  typeof (c as any)?.id === "string" && (c as any).id.endsWith(":Text");
+const isLoroMap = (c: unknown): c is LoroMap<any> =>
+  typeof (c as any)?.id === "string" && (c as any).id.endsWith(":Map");
 
 // ─── Delta schema ────────────────────────────────────────────────────────────
 
@@ -180,6 +197,9 @@ function deltaToPNode(
 
 /**
  * Compute the minimal diff between two PM docs and apply it as real PM steps.
+ * Uses the Loro-derived nodes (from createNodeFromLoroObj) for changed blocks,
+ * which ensures WEAK_NODE_TO_LORO_CONTAINER_MAPPING entries are set correctly.
+ *
  * Returns the transaction with the steps applied, or null if docs are identical.
  */
 export function diffPmDocs(
@@ -190,11 +210,131 @@ export function diffPmDocs(
   const oldDelta = nodeToDelta(oldDoc);
   const newDelta = nodeToDelta(newDoc);
   const diff = delta.diff(oldDelta, newDelta);
-  // Check if diff is empty (no changes) — children is iterable, not necessarily an array
+  // Check if diff is empty
   let hasChanges = false;
   for (const op of (diff as any).children) {
     if (!delta.$retainOp.check(op)) { hasChanges = true; break; }
   }
   if (!hasChanges) return null;
-  return deltaToPSteps(tr, diff);
+
+  // Apply the diff using the newDoc's actual nodes (from createNodeFromLoroObj)
+  // rather than creating new nodes via deltaToPNode. This preserves the
+  // WEAK_NODE_TO_LORO_CONTAINER_MAPPING entries set by createNodeFromLoroObj.
+  return applyBlockDiff(tr, oldDoc, newDoc, diff);
+}
+
+/**
+ * Apply a block-level diff using the actual nodes from newDoc.
+ * For unchanged blocks: keep oldDoc nodes (PM step mapping handles cursor).
+ * For changed/inserted blocks: use newDoc nodes (have correct mapping entries).
+ */
+function applyBlockDiff(
+  tr: Transaction,
+  oldDoc: Node,
+  newDoc: Node,
+  diff: delta.DeltaAny,
+): Transaction {
+  let oldIdx = 0;
+  let newIdx = 0;
+  let pos = 0; // current position in tr.doc
+
+  for (const op of (diff as any).children) {
+    if (delta.$retainOp.check(op)) {
+      // Unchanged blocks — skip over them
+      for (let i = 0; i < op.retain; i++) {
+        pos += oldDoc.child(oldIdx).nodeSize;
+        oldIdx++;
+        newIdx++;
+      }
+    } else if (delta.$modifyOp.check(op)) {
+      // Block content changed — replace with newDoc's version
+      const oldBlock = oldDoc.child(oldIdx);
+      const newBlock = newDoc.child(newIdx);
+      tr.replace(pos, pos + oldBlock.nodeSize, new Slice(Fragment.from(newBlock), 0, 0));
+      pos += newBlock.nodeSize;
+      oldIdx++;
+      newIdx++;
+    } else if (delta.$insertOp.check(op)) {
+      // New blocks inserted — use newDoc's nodes
+      const insertedBlocks: Node[] = [];
+      for (let i = 0; i < (op.insert as any[]).length; i++) {
+        insertedBlocks.push(newDoc.child(newIdx++));
+      }
+      tr.replace(pos, pos, new Slice(Fragment.from(insertedBlocks), 0, 0));
+      pos += insertedBlocks.reduce((s, b) => s + b.nodeSize, 0);
+    } else if (delta.$deleteOp.check(op)) {
+      // Blocks deleted
+      let deleteSize = 0;
+      for (let i = 0; i < op.delete; i++) {
+        deleteSize += oldDoc.child(oldIdx++).nodeSize;
+      }
+      tr.replace(pos, pos + deleteSize, Slice.empty);
+    }
+  }
+  return tr;
+}
+
+/**
+ * After diffPmDocs, the new PM doc has nodes created by deltaToPNode which
+ * don't have WEAK_NODE_TO_LORO_CONTAINER_MAPPING entries. This function walks
+ * the Loro doc and the new PM doc in parallel to rebuild the mapping.
+ *
+ * The Loro doc and the new PM doc have the same structure (that's the point
+ * of the diff), so we can walk them together and establish the correspondence.
+ */
+export function rebuildMappingAfterDiff(
+  loroDoc: LoroDocType,
+  pmDoc: Node,
+  mapping: LoroNodeMapping,
+  containerId?: import("loro-crdt").ContainerID,
+): void {
+  mapping.clear();
+  const innerDoc = containerId
+    ? (loroDoc.getContainerById(containerId) as LoroMap<LoroNodeContainerType>)
+    : loroDoc.getMap(ROOT_DOC_KEY);
+  if (!innerDoc) return;
+  // Map root
+  mapping.set(innerDoc.id, pmDoc);
+  WEAK_NODE_TO_LORO_CONTAINER_MAPPING.set(pmDoc, innerDoc.id);
+  // Walk children in parallel
+  const loroChildren = innerDoc.get(CHILDREN_KEY) as LoroList | undefined;
+  if (!loroChildren) return;
+  walkLoroAndPm(loroChildren, pmDoc, mapping);
+}
+
+function walkLoroAndPm(
+  loroList: LoroList,
+  pmNode: Node,
+  mapping: LoroNodeMapping,
+): void {
+  const pmChildren = pmNode.content.content;
+  const loroLen = loroList.length;
+  let pmIdx = 0;
+  console.debug("[pm-diff] walkLoroAndPm", { loroLen, pmChildCount: pmChildren.length });
+  for (let i = 0; i < loroLen && pmIdx < pmChildren.length; i++) {
+    const loroChild = loroList.get(i);
+    if (!loroChild) continue;
+    const cid = (loroChild as any)?.id ?? "unknown";
+    console.debug("[pm-diff] loroChild", { cid, isText: isLoroText(loroChild), isMap: isLoroMap(loroChild) });
+    if (isLoroText(loroChild)) {
+      // LoroText → collect consecutive PM text nodes
+      const textNodes: Node[] = [];
+      while (pmIdx < pmChildren.length && pmChildren[pmIdx].isText) {
+        textNodes.push(pmChildren[pmIdx++]);
+      }
+      if (textNodes.length > 0) {
+        mapping.set(loroChild.id, textNodes);
+        for (const tn of textNodes) {
+          WEAK_NODE_TO_LORO_CONTAINER_MAPPING.set(tn, loroChild.id);
+        }
+      }
+    } else if (isLoroMap(loroChild)) {
+      const pmChild = pmChildren[pmIdx++];
+      if (!pmChild) break;
+      mapping.set(loroChild.id, pmChild);
+      WEAK_NODE_TO_LORO_CONTAINER_MAPPING.set(pmChild, loroChild.id);
+      const childList = loroChild.get(CHILDREN_KEY) as LoroList | undefined;
+      if (childList) walkLoroAndPm(childList, pmChild, mapping);
+    }
+  }
 }
